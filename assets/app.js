@@ -1,0 +1,730 @@
+/* Console College league site.
+   Static: everything comes from data/*.json, plus one locked file per team that only that
+   team's password opens (PBKDF2 → AES-CTR + HMAC, in the browser). Orders are built here and
+   signed with the team's key into one code the commissioner imports. */
+"use strict";
+
+const S = { manifest: null, rules: null, cache: {}, B: null, draft: null, recruits: null, recById: {}, teamById: {} };
+const $ = (sel, el = document) => el.querySelector(sel);
+const app = () => $("#app");
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const store = {
+  get(k) { try { return JSON.parse(localStorage.getItem(k)); } catch (e) { return null; } },
+  set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) { /* private window: keep going */ } },
+  del(k) { try { localStorage.removeItem(k); } catch (e) { /* ignore */ } },
+};
+const sess = {
+  get(k) { try { return JSON.parse(sessionStorage.getItem(k)); } catch (e) { return null; } },
+  set(k, v) { try { sessionStorage.setItem(k, JSON.stringify(v)); } catch (e) { /* ignore */ } },
+  del(k) { try { sessionStorage.removeItem(k); } catch (e) { /* ignore */ } },
+};
+const stars = (n) => `<span class="stars" aria-label="${n} stars">${"★".repeat(n || 0)}</span>`;
+const team = (id) => S.teamById[id] || { school: id, id };
+const teamLink = (id) => `<a href="#/team/${esc(id)}">${esc(team(id).school)}</a>`;
+const rk = (r) => (r ? `<span class="rk">${r}</span>` : "");
+
+// ═══ Data ═══════════════════════════════════════════════════════════════════
+
+async function getJSON(path) {
+  if (S.cache[path]) return S.cache[path];
+  const r = await fetch(`data/${path}?c=${S.manifest ? S.manifest.cycle : Date.now()}`);
+  if (!r.ok) throw new Error(`Couldn't load ${path} (${r.status}).`);
+  return (S.cache[path] = await r.json());
+}
+
+async function loadRecruits() {
+  if (!S.recruits) {
+    S.recruits = await getJSON("recruits.json");
+    S.recruits.forEach((r) => (S.recById[r.id] = r));
+  }
+  return S.recruits;
+}
+
+// ═══ Crypto: unlock a team file, sign a code ═══════════════════════════════
+
+const te = new TextEncoder();
+function b64url(bytes) {
+  let s = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+function hexBytes(h) { const out = new Uint8Array(h.length / 2); for (let i = 0; i < out.length; i++) out[i] = parseInt(h.substr(i * 2, 2), 16); return out; }
+async function inflate(bytes) {
+  const s = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("deflate"));
+  return await new Response(s).text();
+}
+async function deflate(bytes) {
+  const s = new Blob([bytes]).stream().pipeThrough(new CompressionStream("deflate"));
+  return new Uint8Array(await new Response(s).arrayBuffer());
+}
+
+async function unlockTeam(id, password) {
+  if (!window.crypto || !crypto.subtle) throw new Error("This browser can't unlock team files here. Open the site over https.");
+  const r = await fetch(`data/private/${id}.bin?c=${S.manifest.cycle}`);
+  if (!r.ok) throw new Error("That program has no locked file this cycle. It may be a CPU team.");
+  const buf = new Uint8Array(await r.arrayBuffer());
+  if (String.fromCharCode(...buf.slice(0, 4)) !== "CCX1") throw new Error("That team file is damaged. Ask the commissioner to export again.");
+  const salt = buf.slice(4, 20), iters = new DataView(buf.buffer).getUint32(20), nonce = buf.slice(24, 40);
+  const tag = buf.slice(40, 72), body = buf.slice(72);
+  const pw = te.encode(password.replace(/\s+/g, "").toLowerCase());
+  const base = await crypto.subtle.importKey("raw", pw, "PBKDF2", false, ["deriveBits"]);
+  const bits = new Uint8Array(await crypto.subtle.deriveBits({ name: "PBKDF2", salt, iterations: iters, hash: "SHA-256" }, base, 512));
+  const macKey = await crypto.subtle.importKey("raw", bits.slice(32), { name: "HMAC", hash: "SHA-256" }, false, ["verify"]);
+  const signed = new Uint8Array(40 + body.length); signed.set(buf.slice(0, 40)); signed.set(body, 40);
+  if (!(await crypto.subtle.verify("HMAC", macKey, tag, signed))) throw new Error("That password doesn't open this team's file.");
+  const encKey = await crypto.subtle.importKey("raw", bits.slice(0, 32), { name: "AES-CTR" }, false, ["decrypt"]);
+  const plain = new Uint8Array(await crypto.subtle.decrypt({ name: "AES-CTR", counter: nonce, length: 64 }, encKey, body));
+  return JSON.parse(await inflate(plain));
+}
+
+async function signCode(B, orders) {
+  const payload = { v: S.rules.version, l: B.league, t: B.team, c: B.cycle, o: orders };
+  const body = b64url(await deflate(te.encode(JSON.stringify(payload))));
+  const head = `${S.rules.prefix}.${body}`;
+  const key = await crypto.subtle.importKey("raw", hexBytes(B.secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const sig = new Uint8Array(await crypto.subtle.sign("HMAC", key, te.encode(head))).slice(0, 16);
+  return `${head}.${b64url(sig)}`;
+}
+
+// ═══ Session and the draft of this week's orders ═══════════════════════════
+
+function draftKey(B) { return `cc:${B.league}:${B.id}:${B.cycle}`; }
+
+function freshDraft(B) {
+  const R = B.recruiting, G = B.gameday;
+  const ap = R.auto || {};
+  return {
+    board: [...R.board],
+    queue: R.queue.map((e) => ({ rid: e.rid, act: e.act, rule: e.rule, n: e.n || 0, pitch: e.pitch || "auto", last: e.last })),
+    auto: { OC: [!!(ap.OC && ap.OC.on), (ap.OC && ap.OC.hours) || 10], DC: [!!(ap.DC && ap.DC.on), (ap.DC && ap.DC.hours) || 10] },
+    ov: {}, nil: {}, prom: {}, pwo: [],
+    plan: G.plan ? { ...G.plan, script: !!G.plan.script } : { focus: "balanced", off: "film", def: "film", script: false },
+    calls: { off: G.calls.off, def: G.calls.def },
+    locks: JSON.parse(JSON.stringify(G.locks || {})),
+  };
+}
+function saveDraft() { if (S.B && S.draft) store.set(draftKey(S.B), S.draft); }
+function loadDraft(B) { return store.get(draftKey(B)) || freshDraft(B); }
+
+async function login(id, password) {
+  const B = await unlockTeam(id, password);
+  if (B.cycle !== S.manifest.cycle) throw new Error("This team file is from another cycle. Reload the page.");
+  S.B = B;
+  S.draft = loadDraft(B);
+  sess.set("cc-login", { id, pw: password });
+  renderWho();
+}
+function logout() {
+  S.B = null; S.draft = null; sess.del("cc-login"); renderWho(); location.hash = "#/";
+}
+const known = (rid) => (S.B && S.B.recruiting.known.find((k) => k.id === rid)) || null;
+
+// ═══ Hours: what the week's orders will cost (mirrors the game's queue) ════
+
+function hoursAvailable() {
+  const B = S.B, d = S.draft;
+  const bonus = d.plan.focus === "recruit" ? (S.rules.focus.recruit.hours || 0) : 0;
+  return Math.max(0, B.recruiting.hours.total - B.recruiting.hours.used) + bonus;
+}
+
+function planHours() {
+  const B = S.B, d = S.draft, costs = B.recruiting.costs;
+  const offered = new Set(B.recruiting.known.filter((k) => k.offered).map((k) => k.id));
+  let used = 0;
+  const notes = [];
+  // one-time moves happen first (an offer they need is made now)
+  const needOffer = new Set([...Object.keys(d.nil), ...Object.keys(d.prom), ...Object.keys(d.ov)].map(Number));
+  for (const rid of needOffer) {
+    if (!offered.has(rid) && d.queue.some((e) => e.rid === rid && e.act === "offer")) { used += costs.offer; offered.add(rid); }
+  }
+  for (const rid of Object.keys(d.ov)) used += S.rules.ovCost;
+  for (const [rid, kind] of Object.entries(d.prom)) used += (S.rules.promises[kind] || {}).cost || 0;
+  const avail = hoursAvailable();
+  const playedWeek = S.manifest.week;
+  const rows = d.queue.map((e) => {
+    const k = known(e.rid) || {};
+    const pub = S.recById[e.rid] || {};
+    let status = "runs", cost = costs[e.act] || 0;
+    if (pub.sg) status = "done: he signed";
+    else if (e.rule === "until" && pub.c) status = "done: he committed";
+    else if (e.rule === "biweekly" && e.last && e.last[0] === S.manifest.year && e.last[1] === playedWeek) status = "off week";
+    else if (e.act === "offer" && offered.has(e.rid)) status = "done: offer out";
+    else if (e.act !== "offer" && e.act !== "evaluate" && !offered.has(e.rid)) status = "needs an offer first";
+    else if (e.act === "close" && k.mine) status = "he's already yours";
+    if (status === "runs") {
+      if (used + cost > avail) status = "cut: out of hours";
+      else { used += cost; if (e.act === "offer") offered.add(e.rid); }
+    }
+    return { e, status, cost };
+  });
+  return { used, avail, rows, notes };
+}
+
+// ═══ Shell ═════════════════════════════════════════════════════════════════
+
+function renderWho() {
+  const w = $("#whoami");
+  if (S.B) {
+    w.innerHTML = `<span>${esc(S.B.team)}${S.B.owner ? ` · @${esc(S.B.owner)}` : ""}</span><button type="button" id="logout">Log out</button>`;
+    $("#logout").onclick = logout;
+  } else {
+    w.innerHTML = `<a href="#/login" style="color:inherit">Log in</a>`;
+  }
+  const t = $("#theme-toggle");
+  if (t) t.remove();
+  const tb = document.createElement("button");
+  tb.id = "theme-toggle"; tb.type = "button"; tb.textContent = "Light / dark";
+  tb.onclick = () => {
+    const cur = document.documentElement.dataset.theme || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+    const next = cur === "dark" ? "light" : "dark";
+    document.documentElement.dataset.theme = next; store.set("cc-theme", next);
+  };
+  w.appendChild(tb);
+}
+
+function renderStrip() {
+  const m = S.manifest;
+  const due = [];
+  const names = { rec: "recruiting", depth: "depth chart", plan: "game plan", calls: "play-calling" };
+  m.sections.forEach((s) => due.push(names[s] || s));
+  $("#strip").innerHTML = `<div class="strip-inner"><span class="cycle">Cycle ${m.cycle}</span>
+    <span>${esc(m.label)}</span>
+    <span class="due">${due.length ? `Orders open: <b>${esc(due.join(", "))}</b>` : esc(m.note || "No orders this cycle.")}</span>
+    ${m.note && due.length ? `<span class="due">${esc(m.note)}</span>` : ""}
+    ${m.formUrl ? `<a href="${esc(m.formUrl)}" target="_blank" rel="noopener">Submit your code</a>` : ""}</div>`;
+}
+
+function setNav(route) {
+  document.querySelectorAll("#nav a").forEach((a) => {
+    const h = a.getAttribute("href").slice(2);
+    a.classList.toggle("on", h === "" ? route === "" : route.startsWith(h));
+  });
+}
+
+function showMeter(on) {
+  const m = $("#meter");
+  if (!on || !S.B || !S.manifest.sections.includes("rec")) { m.hidden = true; return; }
+  const p = planHours();
+  const pct = p.avail ? Math.min(100, (p.used / p.avail) * 100) : 0;
+  const over = p.rows.some((r) => r.status.startsWith("cut"));
+  m.hidden = false;
+  m.innerHTML = `<div class="meter-inner">
+    <div class="field-bar ${over ? "over" : ""}" role="meter" aria-valuemin="0" aria-valuemax="${p.avail}" aria-valuenow="${p.used}" aria-label="Recruiting hours">
+      <div class="fill" style="width:${pct}%"></div><div class="lines"></div>
+      <div class="label"><span>${p.used} of ${p.avail} hours<span class="long"> this week</span></span><span class="long">${over ? "some orders will be cut" : `${p.avail - p.used} left`}</span></div>
+    </div>
+    <a class="btn go" href="#/my/code">Build my code</a></div>`;
+}
+
+// ═══ Router ════════════════════════════════════════════════════════════════
+
+const routes = [
+  [/^$/, viewHome], [/^scores(?:\/(\d+))?$/, viewScores], [/^standings$/, viewStandings], [/^polls$/, viewPolls],
+  [/^recruits$/, viewRecruits], [/^recruit\/(\d+)$/, viewRecruit], [/^teams$/, viewTeams], [/^team\/([\w-]+)$/, viewTeam],
+  [/^directory$/, viewDirectory], [/^login$/, viewLogin], [/^my(?:\/(\w+))?$/, viewMy],
+];
+
+async function route() {
+  const h = decodeURIComponent(location.hash.replace(/^#\/?/, ""));
+  const [path, query] = h.split("?");
+  setNav(path);
+  showMeter(false);
+  for (const [re, fn] of routes) {
+    const m = path.match(re);
+    if (m) {
+      try { await fn(...m.slice(1), new URLSearchParams(query || "")); }
+      catch (e) { app().innerHTML = `<div class="note bad">${esc(e.message || e)}</div>`; console.error(e); }
+      window.scrollTo(0, 0);
+      return;
+    }
+  }
+  app().innerHTML = `<p class="empty">That page doesn't exist. <a href="#/">Go to the home page</a>.</p>`;
+}
+
+// ═══ Public pages ══════════════════════════════════════════════════════════
+
+function gameCard(g) {
+  const played = g.played;
+  const awayWon = played && g.a > g.h;
+  return `<div class="game">
+    <div class="row ${played && awayWon ? "won" : ""}"><span>${rk(g.ar)}${teamLink(g.away)}</span><span class="sc">${played ? g.a : ""}</span></div>
+    <div class="row ${played && !awayWon ? "won" : ""}"><span>${g.neutral ? "" : "@ "}${rk(g.hr)}${teamLink(g.home)}</span><span class="sc">${played ? g.h : ""}</span></div>
+    ${g.name ? `<div class="meta">${esc(g.name)}</div>` : played ? "" : `<div class="meta">Upcoming</div>`}</div>`;
+}
+function rankedFirst(games) {
+  return [...games].sort((a, b) => Math.min(a.hr || 99, a.ar || 99) - Math.min(b.hr || 99, b.ar || 99));
+}
+
+async function viewHome() {
+  const [scores, polls, news] = await Promise.all([getJSON("scores.json"), getJSON("polls.json"), getJSON("news.json")]);
+  const m = S.manifest;
+  const last = [...scores].reverse().find((w) => w.games.some((g) => g.played));
+  const next = scores.find((w) => w.games.some((g) => !g.played));
+  const mine = S.B ? `<section class="panel"><h3>${esc(S.B.team)} this week</h3>
+      <p>${S.B.gameday.next ? `Next: ${S.B.gameday.next.site === "away" ? "at" : "vs"} ${esc(S.B.gameday.next.opp)}, Week ${S.B.gameday.next.week}.` : "No game this week."}</p>
+      <p>${S.B.recruiting.hours.total} recruiting hours, ${S.draft.queue.length} standing orders, ${S.draft.board.length} recruits on the board.</p>
+      <a class="btn go" href="#/my/recruiting">Work my board</a></section>` : `<section class="panel"><h3>Coaching a program?</h3><p>Log in with your team's password to see your roster, work your recruiting board and build this week's code.</p><a class="btn go" href="#/login">Log in</a></section>`;
+  app().innerHTML = `<h1>${esc(m.title)}</h1><p class="muted">${esc(m.status)}</p>
+    <div class="grid" style="margin-top:18px">
+      <section class="wide">${mine}</section>
+      <section class="wide"><h2>${last ? esc(last.label) : "This week"}</h2>
+        <div class="games">${(last ? rankedFirst(last.games.filter((g) => g.played)) : (next ? rankedFirst(next.games) : [])).slice(0, 12).map(gameCard).join("")}</div>
+        <p style="margin-top:8px"><a href="#/scores">All scores</a></p></section>
+      <section><h2>Poll</h2><p class="quiet">${esc(polls.label)}</p>${pollTable(polls.poll.slice(0, 10))}<p><a href="#/polls">Full top 25</a></p></section>
+      <section><h2>Headlines</h2>${news.headlines.length ? `<ul>${news.headlines.map((h) => `<li>${esc(h)}</li>`).join("")}</ul>` : `<p class="muted">No headlines yet.</p>`}
+        ${news.recruiting.length ? `<h3 style="margin-top:16px">Recruiting wire</h3><ul>${news.recruiting.slice(0, 8).map((h) => `<li>${esc(h)}</li>`).join("")}</ul>` : ""}</section>
+    </div>`;
+}
+
+function pollTable(rows) {
+  return `<div class="table-wrap"><table><thead><tr><th class="tight">#</th><th>Team</th><th class="r">Record</th><th class="r">Move</th></tr></thead><tbody>
+    ${rows.map((r) => `<tr><td class="num">${r.rank}</td><td>${teamLink(r.id)}</td><td class="r num">${esc(r.record)}</td>
+      <td class="r quiet">${r.new ? "new" : r.move ? (r.move > 0 ? `up ${r.move}` : `down ${-r.move}`) : ""}</td></tr>`).join("")}</tbody></table></div>`;
+}
+
+async function viewScores(week) {
+  const scores = await getJSON("scores.json");
+  const played = scores.filter((w) => w.games.some((g) => g.played));
+  const def = played.length ? played[played.length - 1].week : (scores[0] || {}).week;
+  const wk = Number(week || def);
+  const w = scores.find((x) => x.week === wk) || scores[0];
+  app().innerHTML = `<h1>Scores</h1>
+    <div class="weekpick" style="margin-top:14px">${scores.map((x) => `<a class="chip ${x.week === wk ? "on" : ""}" href="#/scores/${x.week}">${esc(x.label)}</a>`).join("")}</div>
+    ${w ? `<div class="games">${rankedFirst(w.games).map(gameCard).join("")}</div>` : `<p class="empty">No games scheduled yet.</p>`}`;
+}
+
+async function viewStandings() {
+  const st = await getJSON("standings.json");
+  app().innerHTML = `<h1>Standings</h1><div class="grid" style="margin-top:18px">${st.map((c) => `<section>
+    <h2><span class="conf-tag" style="background:${esc((S.manifest.teams.find((t) => t.conf === c.conf) || {}).color)}"></span>${esc(c.name)}</h2>
+    <div class="table-wrap"><table><thead><tr><th>Team</th><th class="r">Conf</th><th class="r">Overall</th></tr></thead><tbody>
+    ${c.rows.map((r) => `<tr class="${S.B && S.B.id === r.id ? "mine" : ""}"><td>${rk(r.rank)}${teamLink(r.id)}</td><td class="r num">${esc(r.conf)}</td><td class="r num">${esc(r.all)}</td></tr>`).join("")}
+    </tbody></table></div></section>`).join("")}</div>`;
+}
+
+async function viewPolls() {
+  const p = await getJSON("polls.json");
+  app().innerHTML = `<h1>Polls</h1><p class="muted">${esc(p.label)}</p><div class="grid" style="margin-top:18px">
+    <section><h2>Media top 25</h2>${pollTable(p.poll)}</section>
+    ${p.cfp.length ? `<section><h2>Playoff committee</h2><div class="table-wrap"><table><tbody>${p.cfp.map((r) => `<tr><td class="num tight">${r.rank}</td><td>${teamLink(r.id)}</td></tr>`).join("")}</tbody></table></div></section>` : ""}
+    ${p.heisman.length ? `<section><h2>Award watch</h2><div class="table-wrap"><table><tbody>${p.heisman.map((h, i) => `<tr><td class="num tight">${i + 1}</td><td>${esc(h.name)}</td><td>${esc(h.pos)}</td><td>${esc(h.school)}</td></tr>`).join("")}</tbody></table></div></section>` : ""}
+    </div>`;
+}
+
+function statusOf(r) {
+  if (r.sg) return `<span class="tag good">Signed: ${esc(team(r.c).school || "")}</span>`;
+  if (r.c) return `<span class="tag">Committed: ${teamLink(r.c)}</span>`;
+  return `<span class="quiet">Open</span>`;
+}
+
+async function viewRecruits(q) {
+  const all = await loadRecruits();
+  const f = {
+    text: q.get("q") || "", pos: q.get("pos") || "", st: q.get("st") || "", stars: q.get("stars") || "",
+    status: q.get("status") || "", board: q.get("board") === "1", page: Number(q.get("page") || 1),
+  };
+  const states = [...new Set(all.map((r) => r.st))].sort();
+  const board = S.draft ? new Set(S.draft.board) : new Set();
+  let rows = all.filter((r) =>
+    (!f.text || r.n.toLowerCase().includes(f.text.toLowerCase()) || (r.hs || "").toLowerCase().includes(f.text.toLowerCase())) &&
+    (!f.pos || r.p === f.pos) && (!f.st || r.st === f.st) && (!f.stars || String(r.s) === f.stars) &&
+    (!f.status || (f.status === "open" ? !r.c : !!r.c)) && (!f.board || board.has(r.id)));
+  const per = 50, pages = Math.max(1, Math.ceil(rows.length / per)), page = Math.min(f.page, pages);
+  const shown = rows.slice((page - 1) * per, page * per);
+  const qs = (o) => "#/recruits?" + new URLSearchParams({ ...{ q: f.text, pos: f.pos, st: f.st, stars: f.stars, status: f.status, board: f.board ? "1" : "", page: String(page) }, ...o }).toString();
+  app().innerHTML = `<h1>Recruits</h1><p class="muted">${all.length.toLocaleString()} prospects in this class. Ratings are never shown: stars are public, and your staff's read comes from evaluating him.</p>
+    <form class="controls" id="rf" style="margin-top:14px">
+      <input type="text" name="q" placeholder="Name or high school" value="${esc(f.text)}" aria-label="Search">
+      <select name="pos" aria-label="Position"><option value="">All positions</option>${S.rules.positions.map((p) => `<option ${p === f.pos ? "selected" : ""}>${p}</option>`).join("")}</select>
+      <select name="stars" aria-label="Stars"><option value="">All stars</option>${[5, 4, 3, 2, 1].map((s) => `<option value="${s}" ${String(s) === f.stars ? "selected" : ""}>${s} star</option>`).join("")}</select>
+      <select name="st" aria-label="State"><option value="">All states</option>${states.map((s) => `<option ${s === f.st ? "selected" : ""}>${esc(s)}</option>`).join("")}</select>
+      <select name="status" aria-label="Status"><option value="">Open and committed</option><option value="open" ${f.status === "open" ? "selected" : ""}>Still open</option><option value="committed" ${f.status === "committed" ? "selected" : ""}>Committed</option></select>
+      ${S.B ? `<label><input type="checkbox" name="board" value="1" ${f.board ? "checked" : ""}> My board only</label>` : ""}
+      <button class="btn" type="submit">Show</button>
+    </form>
+    <div class="table-wrap"><table><thead><tr><th class="tight">Rank</th><th>Name</th><th>Pos</th><th>Stars</th><th>Size</th><th>From</th><th>Status</th><th class="r">Offers</th>${S.B ? "<th>Your staff</th><th></th>" : ""}</tr></thead><tbody>
+    ${shown.map((r) => {
+      const k = known(r.id);
+      return `<tr class="${board.has(r.id) ? "mine" : ""}"><td class="num">${r.r || ""}</td><td><a href="#/recruit/${r.id}">${esc(r.n)}</a>${r.k !== "hs" ? ` <span class="tag">${r.k === "juco" ? "JUCO" : "Intl"}</span>` : ""}</td>
+        <td>${r.p}</td><td>${stars(r.s)}</td><td class="quiet">${esc(r.ht)} ${r.wt || ""}</td><td>${esc(r.st)}<span class="quiet"> ${esc(r.hs)}</span></td><td>${statusOf(r)}</td><td class="r num">${r.of.length}</td>
+        ${S.B ? `<td class="quiet">${k ? esc(k.standing) : ""}</td><td>${S.manifest.sections.includes("rec") && !r.sg ? `<button class="btn small" data-board="${r.id}">${board.has(r.id) ? "Remove" : "Add to board"}</button>` : ""}</td>` : ""}</tr>`;
+    }).join("") || `<tr><td colspan="9" class="empty">No recruits match. Clear a filter.</td></tr>`}
+    </tbody></table></div>
+    <div class="pager"><a class="btn small ${page <= 1 ? "ghost" : ""}" href="${qs({ page: String(Math.max(1, page - 1)) })}">Previous</a><span class="quiet">Page ${page} of ${pages} · ${rows.length.toLocaleString()} recruits</span><a class="btn small ${page >= pages ? "ghost" : ""}" href="${qs({ page: String(Math.min(pages, page + 1)) })}">Next</a></div>`;
+  $("#rf").onsubmit = (ev) => {
+    ev.preventDefault();
+    const fd = new FormData(ev.target);
+    location.hash = "#/recruits?" + new URLSearchParams({ q: fd.get("q") || "", pos: fd.get("pos") || "", st: fd.get("st") || "", stars: fd.get("stars") || "", status: fd.get("status") || "", board: fd.get("board") ? "1" : "", page: "1" });
+  };
+  app().onclick = (ev) => {
+    const b = ev.target.closest("[data-board]");
+    if (!b) return;
+    toggleBoard(Number(b.dataset.board));
+    viewRecruits(q);
+  };
+}
+
+function toggleBoard(rid) {
+  const d = S.draft;
+  const i = d.board.indexOf(rid);
+  if (i >= 0) { d.board.splice(i, 1); d.queue = d.queue.filter((e) => e.rid !== rid); }
+  else if (d.board.length >= S.rules.boardMax) { alert(`Your board holds ${S.rules.boardMax}. Remove someone first.`); return; }
+  else d.board.push(rid);
+  saveDraft();
+}
+
+async function viewRecruit(id) {
+  await loadRecruits();
+  const r = S.recById[Number(id)];
+  if (!r) { app().innerHTML = `<p class="empty">That recruit isn't in this class.</p>`; return; }
+  const k = known(r.id);
+  const onBoard = S.draft && S.draft.board.includes(r.id);
+  const open = S.B && S.manifest.sections.includes("rec") && !r.sg;
+  let staff = "";
+  if (S.B) {
+    const d = S.draft;
+    const pri = Object.entries(S.rules.priorities);
+    staff = `<section class="panel" style="margin-top:20px"><h2>Your staff on ${esc(r.n.split(" ")[0])}</h2>
+      ${k ? `<p><b>${esc(k.standing)}</b>${k.mine ? " · committed to you" : ""}${k.offered ? " · you've offered" : ""}</p>
+        <p>${k.proj ? `Staff projection: <b>${esc(k.proj)}</b> (evaluated ${k.scout} of 3)` : "Not evaluated yet. Queue an evaluation; your staff's read shows up next week."}</p>
+        <p>${k.knows.length ? `What he cares about: <b>${k.knows.map(esc).join(", ")}</b>` : "You don't know what he cares about yet. Evaluations and conversations reveal it."}</p>
+        ${k.ov ? `<p>Official visit set for Week ${k.ov}.</p>` : ""}${k.nil ? `<p>Your NIL offer: $${k.nil.toLocaleString()}/yr</p>` : ""}${k.promise ? `<p>You promised: ${esc((S.rules.promises[k.promise] || {}).label || k.promise)}</p>` : ""}
+        ${k.log.length ? `<p class="quiet">${k.log.map(esc).join("<br>")}</p>` : ""}` : `<p class="muted">Your staff hasn't worked him yet.</p>`}
+      ${open ? `<div class="controls" style="margin-top:12px"><button class="btn ${onBoard ? "" : "go"}" id="tb">${onBoard ? "Remove from board" : "Add to board"}</button></div>
+        ${onBoard ? `<h3 style="margin-top:14px">Add a standing order</h3>
+        <div class="controls"><select id="qa">${Object.entries(S.rules.actions).map(([a, v]) => `<option value="${a}">${esc(v.label)} (${S.B.recruiting.costs[a]}h)</option>`).join("")}</select>
+          <select id="qr">${Object.entries(S.rules.queueRules).map(([a, v]) => `<option value="${a}">${esc(v.replace("{n}", "N"))}</option>`).join("")}</select>
+          <select id="qp"><option value="auto">Pitch: best we know</option>${pri.map(([a, v]) => `<option value="${a}">Pitch: ${esc(v)}</option>`).join("")}</select>
+          <button class="btn" id="qadd">Add to queue</button></div>
+        <h3 style="margin-top:14px">This week only</h3>
+        <div class="controls">
+          <select id="ovw" ${(k && k.canOv) || d.queue.some((e) => e.rid === r.id && e.act === "offer") ? "" : "disabled"}><option value="">Official visit: none</option>${S.B.recruiting.homeGames.map((g) => `<option value="${g.week}" ${d.ov[r.id] == g.week ? "selected" : ""}>Week ${g.week} vs ${esc(g.opp)}</option>`).join("")}</select>
+          <label>NIL $/yr <input type="number" id="nil" min="0" step="5000" value="${d.nil[r.id] ?? (k ? k.nil : 0)}"></label>
+          <select id="prom" ${k && k.promise ? "disabled" : ""}><option value="">Promise: none</option>${Object.entries(S.rules.promises).map(([a, v]) => `<option value="${a}" ${d.prom[r.id] === a ? "selected" : ""}>${esc(v.label)} (${v.cost}h)</option>`).join("")}</select>
+          ${S.B.recruiting.pwoOpen && r.s <= 2 ? `<label><input type="checkbox" id="pwo" ${d.pwo.includes(r.id) ? "checked" : ""}> Preferred walk-on</label>` : ""}
+          <button class="btn" id="once">Save</button></div>
+        ${k && k.whyOv && !k.canOv ? `<p class="quiet">Visit: ${esc(k.whyOv)}</p>` : ""}${k && k.whyPromise ? `<p class="quiet">Promise: ${esc(k.whyPromise)}</p>` : ""}` : ""}` : ""}
+      </section>`;
+  }
+  app().innerHTML = `<p><a href="#/recruits">Recruits</a></p><h1>${esc(r.n)}</h1>
+    <p class="muted">${r.p} · ${stars(r.s)} · ${r.r ? `No. ${r.r} nationally, ${r.pr} at ${r.p}` : "unranked"} · ${esc(r.ht)} ${r.wt || ""} · ${esc(r.hs)} (${esc(r.st)})</p>
+    <p>${statusOf(r)}</p>
+    <div class="grid" style="margin-top:16px">
+      <section><h2>Offers</h2>${r.of.length ? `<div class="schools">${r.of.map(teamLink).join("")}</div>` : `<p class="muted">No offers yet.</p>`}</section>
+      <section><h2>Top schools</h2>${r.top.length ? `<ol>${r.top.map((t) => `<li>${teamLink(t)}</li>`).join("")}</ol>` : `<p class="muted">No favorites yet.</p>`}</section>
+    </div>${staff}`;
+  if (!open) return;
+  $("#tb").onclick = () => { toggleBoard(r.id); viewRecruit(id); };
+  const add = $("#qadd");
+  if (add) add.onclick = () => {
+    const rule = $("#qr").value;
+    S.draft.queue.push({ rid: r.id, act: $("#qa").value, rule, n: rule === "weeks" ? 2 : 0, pitch: $("#qp").value, last: null });
+    saveDraft(); location.hash = "#/my/recruiting";
+  };
+  const once = $("#once");
+  if (once) once.onclick = () => {
+    const d = S.draft, ov = $("#ovw").value, nil = Number($("#nil").value || 0), pr = $("#prom").value, pw = $("#pwo");
+    if (ov) d.ov[r.id] = Number(ov); else delete d.ov[r.id];
+    if (nil !== (k ? k.nil : 0)) d.nil[r.id] = nil; else delete d.nil[r.id];
+    if (pr) d.prom[r.id] = pr; else delete d.prom[r.id];
+    if (pw) { d.pwo = d.pwo.filter((x) => x !== r.id); if (pw.checked) d.pwo.push(r.id); }
+    saveDraft(); viewRecruit(id);
+  };
+}
+
+async function viewTeams() {
+  const by = {};
+  S.manifest.teams.forEach((t) => (by[t.confName] = by[t.confName] || []).push(t));
+  app().innerHTML = `<h1>Teams</h1><div class="grid" style="margin-top:18px">${Object.entries(by).sort().map(([c, ts]) => `<section><h2><span class="conf-tag" style="background:${esc(ts[0].color)}"></span>${esc(c)}</h2>
+    <div class="table-wrap"><table><tbody>${ts.map((t) => `<tr><td>${teamLink(t.id)}</td><td class="r num">${esc(t.record)}</td><td class="quiet">${t.owner ? "@" + esc(t.owner) : "CPU"}</td></tr>`).join("")}</tbody></table></div></section>`).join("")}</div>`;
+}
+
+async function viewTeam(id) {
+  const [T] = await Promise.all([getJSON(`teams/${id}.json`), loadRecruits()]);
+  const meta = team(id), c = T.card || {};
+  const groups = {};
+  T.roster.forEach((p) => (groups[p.p] = groups[p.p] || []).push(p));
+  app().innerHTML = `<h1>${esc(meta.school)} ${esc(meta.nick || "")}</h1>
+    <p class="muted">${esc(meta.confName)} · ${esc(c.record || meta.record)} (${esc(c.confRecord || meta.confRecord)} conference)${c.rank ? ` · ranked ${c.rank}` : ""} · head coach ${esc(T.coach.name)}${T.coach.record ? ` (${esc(T.coach.record)})` : ""} · ${meta.owner ? "@" + esc(meta.owner) : "CPU program"}</p>
+    ${c.looks && c.looks.team ? `<p>Around the league they look <b>${esc(c.looks.team)}</b>: offense ${esc(c.looks.offense || "")}, defense ${esc(c.looks.defense || "")}.</p>` : ""}
+    <div class="grid" style="margin-top:18px">
+      <section><h2>Schedule</h2><div class="table-wrap"><table><tbody>${(T.schedule || []).map((g) => `<tr><td class="quiet tight">${esc(g.wk)}</td><td>${g.site === "at" ? "at " : ""}${rk(g.oppRank)}${esc(g.opp)}</td><td class="r num">${g.played ? `${g.won ? "W" : "L"} ${esc(g.score)}` : ""}</td></tr>`).join("")}</tbody></table></div></section>
+      <section><h2>Committed</h2>${T.commits.length ? `<ul>${T.commits.map((rid) => { const r = S.recById[rid]; return r ? `<li><a href="#/recruit/${rid}">${esc(r.n)}</a> ${r.p} ${stars(r.s)}</li>` : ""; }).join("")}</ul>` : `<p class="muted">No public commitments yet.</p>`}</section>
+      <section class="wide"><h2>Roster</h2><p class="quiet">From the outside you see a rough tier for each player, his traits and his stats. Only his own staff sees more.</p>
+        <div class="table-wrap"><table><thead><tr><th class="tight">#</th><th>Name</th><th>Pos</th><th>Class</th><th>Size</th><th>Tier (approx.)</th><th>Traits</th><th>Season</th></tr></thead><tbody>
+        ${Object.values(groups).flat().map((p) => `<tr><td class="num">${p.num}</td><td>${esc(p.n)}${p.inj ? ` <span class="tag bad">${esc(p.inj)}</span>` : ""}</td><td>${p.p}</td><td>${esc(p.yr)}</td><td class="quiet">${esc(p.ht)} ${p.wt}</td><td>${esc(p.tier)}</td><td class="traits">${p.traits.map(esc).join(", ")}</td><td class="quiet">${esc(p.stats)}</td></tr>`).join("")}
+        </tbody></table></div></section></div>`;
+}
+
+async function viewDirectory() {
+  const ts = S.manifest.teams;
+  const by = {};
+  ts.forEach((t) => (by[t.confName] = by[t.confName] || []).push(t));
+  const n = ts.filter((t) => t.owner).length;
+  app().innerHTML = `<h1>League directory</h1><p class="muted">${n} programs have a coach in the league. ${ts.length - n} are open: ask the commissioner to claim one.</p>
+    <div class="grid" style="margin-top:18px">${Object.entries(by).sort().map(([c, list]) => `<section><h2>${esc(c)}</h2><div class="table-wrap"><table><tbody>
+    ${list.map((t) => `<tr><td>${teamLink(t.id)}</td><td>${t.owner ? "@" + esc(t.owner) : `<span class="tag good">Open</span>`}</td></tr>`).join("")}</tbody></table></div></section>`).join("")}</div>`;
+}
+
+// ═══ Log in ════════════════════════════════════════════════════════════════
+
+async function viewLogin() {
+  const ts = S.manifest.teams.filter((t) => t.owner);
+  app().innerHTML = `<div class="login"><h1>Log in</h1><p class="muted">Pick your program and enter the password the commissioner sent you. It unlocks your team's file right here in your browser; nothing is sent anywhere.</p>
+    <form id="lf" style="margin-top:16px">
+      <div class="field"><label for="lt">Program</label><select id="lt" required><option value="">Choose your program</option>${ts.map((t) => `<option value="${esc(t.id)}">${esc(t.school)} (@${esc(t.owner)})</option>`).join("")}</select></div>
+      <div class="field"><label for="lp">Password</label><input type="password" id="lp" autocomplete="current-password" required placeholder="four words and a number"></div>
+      <button class="btn go" type="submit" id="lb">Log in</button><p id="le" class="note bad" hidden></p></form></div>`;
+  $("#lf").onsubmit = async (ev) => {
+    ev.preventDefault();
+    $("#lb").disabled = true; $("#lb").textContent = "Unlocking…"; $("#le").hidden = true;
+    try { await login($("#lt").value, $("#lp").value); location.hash = "#/my/recruiting"; }
+    catch (e) { $("#le").hidden = false; $("#le").textContent = e.message; $("#lb").disabled = false; $("#lb").textContent = "Log in"; }
+  };
+}
+
+// ═══ My team ═══════════════════════════════════════════════════════════════
+
+async function viewMy(tab) {
+  if (!S.B) { location.hash = "#/login"; return; }
+  await loadRecruits();
+  tab = tab || "recruiting";
+  const tabs = [["recruiting", "Recruiting"], ["gameday", "Game day"], ["roster", "Roster"], ["coach", "Coach"], ["code", "Code"]];
+  const head = `<h1>${esc(S.B.team)}</h1><nav class="subnav" aria-label="My team">${tabs.map(([k, v]) => `<a href="#/my/${k}" class="${k === tab ? "on" : ""}">${v}</a>`).join("")}</nav>`;
+  const fn = { recruiting: myRecruiting, gameday: myGameday, roster: myRoster, coach: myCoach, code: myCode }[tab] || myRecruiting;
+  app().innerHTML = head + `<div id="mybody"></div>`;
+  fn($("#mybody"));
+  showMeter(tab !== "code");
+}
+
+function rerender(tabFn) { tabFn($("#mybody")); showMeter(true); }
+
+function myRecruiting(el) {
+  const B = S.B, d = S.draft, R = B.recruiting, open = S.manifest.sections.includes("rec");
+  const p = planHours();
+  const lw = R.lastWeek || {};
+  const name = (rid) => (S.recById[rid] || {}).n || `#${rid}`;
+  const pitchOpts = (e) => {
+    const k = known(e.rid);
+    const keys = k ? k.knowsKeys : [];
+    const all = Object.entries(S.rules.priorities);
+    return `<option value="auto">Best we know</option>` + all.map(([a, v]) => `<option value="${a}" ${e.pitch === a ? "selected" : ""}>${esc(v)}${keys.includes(a) ? " (he cares)" : ""}</option>`).join("");
+  };
+  el.innerHTML = `
+    ${!open ? `<div class="note">${esc(S.manifest.note || "Recruiting orders aren't open this cycle.")}</div>` : ""}
+    <p class="muted">${R.hours.phase} week: <b>${R.hours.total}</b> staff hours${d.plan.focus === "recruit" ? ` plus ${S.rules.focus.recruit.hours} from a recruiting-week practice plan` : ""}. Orders run top to bottom; anything that doesn't fit is cut. What your staff learns shows up after the week is played.</p>
+    ${lw.week ? `<div class="note good">Last week: ${lw.ran.length} orders ran${lw.cut.length ? `, ${lw.cut.length} cut for hours` : ""}${lw.done.length ? `, ${lw.done.length} finished` : ""}.</div>` : ""}
+    <section><h2>Standing orders</h2>
+      <div id="queue">${d.queue.length ? p.rows.map((r, i) => `<div class="queue-row ${r.status === "runs" ? "" : "cut"}">
+        <span class="pos">${i + 1}</span>
+        <span><a href="#/recruit/${r.e.rid}">${esc(name(r.e.rid))}</a><br><span class="quiet">${esc(r.status)}${r.status === "runs" ? `, ${r.cost}h` : ""}</span></span>
+        <select data-q="${i}" data-f="act" ${open ? "" : "disabled"} aria-label="Action">${Object.entries(S.rules.actions).map(([a, v]) => `<option value="${a}" ${a === r.e.act ? "selected" : ""}>${esc(v.label)} (${B.recruiting.costs[a]}h)</option>`).join("")}</select>
+        <span class="weeks"><select data-q="${i}" data-f="rule" ${open ? "" : "disabled"} aria-label="Repeat">${Object.entries(S.rules.queueRules).map(([a, v]) => `<option value="${a}" ${a === r.e.rule ? "selected" : ""}>${esc(v.replace("{n}", "N"))}</option>`).join("")}</select>
+          ${r.e.rule === "weeks" ? `<input type="number" min="1" max="20" value="${r.e.n || 1}" data-q="${i}" data-f="n" aria-label="Weeks" style="width:64px">` : ""}</span>
+        <select data-q="${i}" data-f="pitch" ${open ? "" : "disabled"} aria-label="Pitch">${pitchOpts(r.e)}</select>
+        <span class="ops">${open ? `<button class="iconbtn" data-move="${i}" data-dir="-1" ${i === 0 ? "disabled" : ""} aria-label="Move up">↑</button><button class="iconbtn" data-move="${i}" data-dir="1" ${i === d.queue.length - 1 ? "disabled" : ""} aria-label="Move down">↓</button><button class="iconbtn" data-del="${i}" aria-label="Remove">✕</button>` : ""}</span>
+      </div>`).join("") : `<p class="empty">No standing orders yet. Open a recruit on your board to add one.</p>`}</div>
+    </section>
+    <section><h2>Coordinators on autopilot</h2><p class="quiet">They work their side of your board with the hours left after your orders.</p>
+      <div class="controls">${["OC", "DC"].map((r) => `<label><input type="checkbox" data-auto="${r}" ${d.auto[r][0] ? "checked" : ""} ${open ? "" : "disabled"}> ${r === "OC" ? "Offense" : "Defense"} (${r})</label>
+        <label>up to <input type="number" min="0" max="60" data-autoh="${r}" value="${d.auto[r][1]}" ${open ? "" : "disabled"}> hours</label>`).join("")}</div></section>
+    <section><h2>Your board <span class="quiet">${d.board.length} of ${S.rules.boardMax}</span></h2>
+      <p class="quiet">Find prospects on the <a href="#/recruits">recruits page</a> and add them. Open a name to queue orders, set a visit, NIL or a promise.</p>
+      <div class="table-wrap"><table><thead><tr><th>Name</th><th>Pos</th><th>Stars</th><th>Status</th><th>Where you stand</th><th>Staff projection</th><th>He cares about</th><th></th></tr></thead><tbody>
+      ${d.board.map((rid) => { const r = S.recById[rid] || {}; const k = known(rid) || {}; return `<tr><td><a href="#/recruit/${rid}">${esc(r.n)}</a></td><td>${r.p || ""}</td><td>${stars(r.s)}</td><td>${r.c ? statusOf(r) : `<span class="quiet">Open</span>`}</td>
+        <td>${esc(k.standing || "No contact yet")}${k.offered ? ` <span class="tag good">offered</span>` : ""}${d.ov[rid] ? ` <span class="tag">visit wk ${d.ov[rid]}</span>` : k.ov ? ` <span class="tag">visit wk ${k.ov}</span>` : ""}</td>
+        <td>${esc(k.proj || "not evaluated")}</td><td class="quiet">${(k.knows || []).map(esc).join(", ")}</td>
+        <td>${open ? `<button class="btn small ghost" data-rm="${rid}">Remove</button>` : ""}</td></tr>`; }).join("") || `<tr><td colspan="8" class="empty">Your board is empty.</td></tr>`}
+      </tbody></table></div></section>`;
+  el.onchange = (ev) => {
+    const t = ev.target;
+    if (t.dataset.q !== undefined) {
+      const e = d.queue[Number(t.dataset.q)];
+      e[t.dataset.f] = t.dataset.f === "n" ? Math.max(1, Math.min(20, Number(t.value) || 1)) : t.value;
+      if (t.dataset.f === "rule" && t.value === "weeks" && !e.n) e.n = 2;
+    } else if (t.dataset.auto) d.auto[t.dataset.auto][0] = t.checked;
+    else if (t.dataset.autoh) d.auto[t.dataset.autoh][1] = Math.max(0, Math.min(60, Number(t.value) || 0));
+    else return;
+    saveDraft(); rerender(myRecruiting);
+  };
+  el.onclick = (ev) => {
+    const t = ev.target.closest("button");
+    if (!t) return;
+    if (t.dataset.move !== undefined) {
+      const i = Number(t.dataset.move), j = i + Number(t.dataset.dir);
+      [d.queue[i], d.queue[j]] = [d.queue[j], d.queue[i]];
+    } else if (t.dataset.del !== undefined) d.queue.splice(Number(t.dataset.del), 1);
+    else if (t.dataset.rm !== undefined) toggleBoard(Number(t.dataset.rm));
+    else return;
+    saveDraft(); rerender(myRecruiting);
+  };
+}
+
+function myGameday(el) {
+  const B = S.B, d = S.draft, G = B.gameday, R = S.rules;
+  const openPlan = S.manifest.sections.includes("plan"), openDepth = S.manifest.sections.includes("depth"), openCalls = S.manifest.sections.includes("calls");
+  const n = G.next;
+  const keySel = (name, keys, cur, rec) => `<select id="${name}" ${openPlan ? "" : "disabled"}><option value="film" ${cur === "film" ? "selected" : ""}>The film's read${rec ? ` (${esc((keys[rec] || {}).label || rec)})` : ""}</option>
+    ${Object.entries(keys).map(([k, v]) => `<option value="${k}" ${cur === k ? "selected" : ""}>${esc(v.label)}: ${esc(v.blurb)}</option>`).join("")}</select>`;
+  const names = {};
+  B.roster.forEach((p) => (names[p.id] = p));
+  el.innerHTML = `
+    ${n ? `<section class="panel"><h2>Week ${n.week}: ${n.site === "away" ? "at " : n.site === "neutral" ? "vs " : "vs "}<a href="#/team/${esc(n.oppId)}">${esc(n.opp)}</a></h2>
+      ${n.film.length ? `<ul>${n.film.map((x) => `<li>${esc(x)}</li>`).join("")}</ul>` : ""}</section>` : `<div class="note">No game this week.</div>`}
+    <div class="grid" style="margin-top:20px">
+    <section><h2>Practice focus</h2><div class="choices">${[["staff", { label: "The staff's call", blurb: "weather prep when it's coming, balanced otherwise" }], ...Object.entries(R.focus)].map(([k, v]) => `<label class="choice ${d.plan.focus === k ? "on" : ""}"><input type="radio" name="focus" value="${k}" ${d.plan.focus === k ? "checked" : ""} ${openPlan ? "" : "disabled"}><span>${esc(v.label)}<small>${esc(v.blurb)}</small></span></label>`).join("")}</div></section>
+    <section><h2>Game plan</h2>
+      <div class="field"><label for="po">Offense</label>${keySel("po", R.offKeys, d.plan.off, n && n.recOff)}</div>
+      <div class="field"><label for="pd">Defense</label>${keySel("pd", R.defKeys, d.plan.def, n && n.recDef)}</div>
+      <label class="choice ${d.plan.script ? "on" : ""}"><input type="checkbox" id="ps" ${d.plan.script ? "checked" : ""} ${openPlan ? "" : "disabled"}><span>Script the openers<small>your first series follow the plan to the letter</small></span></label>
+      <h2 style="margin-top:22px">Who calls plays</h2>
+      <div class="field"><label for="co">Offense</label><select id="co" ${openCalls ? "" : "disabled"}><option value="HC" ${d.calls.off === "HC" ? "selected" : ""}>You</option>${G.oc ? `<option value="OC" ${d.calls.off === "OC" ? "selected" : ""}>Your OC, ${esc(G.oc)}</option>` : ""}</select></div>
+      <div class="field"><label for="cd">Defense</label><select id="cd" ${openCalls ? "" : "disabled"}><option value="HC" ${d.calls.def === "HC" ? "selected" : ""}>You</option>${G.dc ? `<option value="DC" ${d.calls.def === "DC" ? "selected" : ""}>Your DC, ${esc(G.dc)}</option>` : ""}</select></div>
+    </section></div>
+    <section style="margin-top:28px"><h2>Depth chart</h2><p class="quiet">Leave a position with the staff and they re-sort it every week. Set your own order and it stays until you change it; injured players are skipped automatically.</p>
+      <div class="grid">${R.positions.map((pos) => {
+        const locked = d.locks[pos];
+        const order = locked || G.depth[pos] || [];
+        const starters = G.starters[pos] || 1;
+        return `<div class="depth-pos"><h3>${pos} <span class="quiet">${locked ? "your order" : "staff decides"}</span></h3>
+          ${openDepth ? `<button class="btn small ${locked ? "ghost" : ""}" data-lock="${pos}">${locked ? "Hand back to the staff" : "Set my own order"}</button>` : ""}
+          <ol>${order.map((pid, i) => { const p = names[pid] || {}; return `<li class="${i < starters ? "starter" : ""}"><span class="n">${i + 1}</span><span class="grow">${esc(p.n || pid)} <span class="quiet">${esc(p.yr || "")} · ${esc(p.eval || "")}</span>${p.inj ? ` <span class="tag bad">${esc(p.inj)}</span>` : ""}</span>
+            ${locked && openDepth ? `<button class="iconbtn" data-up="${pos}:${i}" ${i === 0 ? "disabled" : ""} aria-label="Move up">↑</button><button class="iconbtn" data-dn="${pos}:${i}" ${i === order.length - 1 ? "disabled" : ""} aria-label="Move down">↓</button>` : ""}</li>`; }).join("")}</ol></div>`;
+      }).join("")}</div></section>`;
+  el.onchange = (ev) => {
+    const t = ev.target;
+    if (t.name === "focus") d.plan.focus = t.value;
+    else if (t.id === "po") d.plan.off = t.value;
+    else if (t.id === "pd") d.plan.def = t.value;
+    else if (t.id === "ps") d.plan.script = t.checked;
+    else if (t.id === "co") d.calls.off = t.value;
+    else if (t.id === "cd") d.calls.def = t.value;
+    else return;
+    saveDraft(); rerender(myGameday);
+  };
+  el.onclick = (ev) => {
+    const t = ev.target.closest("button");
+    if (!t) return;
+    if (t.dataset.lock) {
+      const pos = t.dataset.lock;
+      if (d.locks[pos]) delete d.locks[pos]; else d.locks[pos] = [...(G.depth[pos] || [])];
+    } else if (t.dataset.up || t.dataset.dn) {
+      const [pos, i0] = (t.dataset.up || t.dataset.dn).split(":"); const i = Number(i0), j = t.dataset.up ? i - 1 : i + 1;
+      const o = d.locks[pos]; [o[i], o[j]] = [o[j], o[i]];
+    } else return;
+    saveDraft(); rerender(myGameday);
+  };
+}
+
+function myRoster(el) {
+  const groups = {};
+  S.B.roster.forEach((p) => (groups[p.p] = groups[p.p] || []).push(p));
+  el.innerHTML = `<p class="muted">What your staff sees. There are no ratings here: you get their read, this week's practice and their notes.</p>
+    ${S.rules.positions.filter((pos) => groups[pos]).map((pos) => `<section><h2>${pos}</h2><div class="players">${groups[pos].map((p) => `<div class="player">
+      <div class="who"><b>${esc(p.n)}</b> <span class="quiet">#${p.num}</span><span class="quiet">${esc(p.yr)}, ${esc(p.ht)} ${p.wt}, ${esc(p.home)}${p.stars ? `, ${p.stars}★ recruit` : ""}</span>
+        <span class="eval">${esc(p.eval)}</span> <span class="quiet">${esc(p.trend)}</span>${p.inj ? ` <span class="tag bad">${esc(p.inj)}</span>` : ""}</div>
+      <div><div class="practice">${esc(p.practice)}</div><p style="margin:4px 0">${esc(p.comments)}</p>
+        <div class="traits">${p.traits.length ? esc(p.traits.join(", ")) + " · " : ""}potential ${esc(p.potential)} · ${esc(p.mood)}${p.nil ? ` · NIL $${p.nil.toLocaleString()}` : ""}${p.stats ? ` · ${esc(p.stats)}` : ""}</div></div>
+    </div>`).join("")}</div></section>`).join("")}`;
+}
+
+function myCoach(el) {
+  const c = S.B.coach || {}, card = S.B.card || {};
+  el.innerHTML = `<div class="grid">
+    <section class="panel"><h2>${esc(c.name || "Head coach")}</h2>
+      <p>Hot seat: <b>${esc(c.seatLabel || "")}</b>${c.seatMove ? ` (${c.seatMove > 0 ? "up" : "down"} ${Math.abs(c.seatMove)} this week)` : ""}</p>
+      ${c.contract ? `<p>Contract: ${esc(c.contract)}</p>` : ""}${c.ad ? `<p>Athletic director: ${esc(c.ad)}</p>` : ""}
+      <p class="muted">${esc(card.record || "")} this season${card.confRecord ? `, ${esc(card.confRecord)} in conference` : ""}</p></section>
+    <section><h2>Your AD's goals</h2>${(c.goals || []).length ? `<div class="table-wrap"><table><tbody>${c.goals.map((g) => `<tr><td>${esc(g.text)}</td><td><span class="tag ${g.status === "met" ? "good" : g.status === "failed" ? "bad" : ""}">${esc(g.status)}</span></td><td class="quiet">${esc(g.note)}</td></tr>`).join("")}</tbody></table></div>` : `<p class="muted">No written goals. The mood is the bar.</p>`}</section></div>`;
+}
+
+function buildOrders() {
+  const B = S.B, d = S.draft, secs = S.manifest.sections, o = {};
+  if (secs.includes("rec")) {
+    const before = new Set(B.recruiting.board), after = new Set(d.board);
+    const rec = {
+      add: d.board.filter((x) => !before.has(x)), drop: B.recruiting.board.filter((x) => !after.has(x)),
+      q: d.queue.map((e) => [e.rid, e.act, e.rule, e.rule === "weeks" ? (e.n || 1) : 0, e.pitch || "auto"]),
+      auto: { OC: [d.auto.OC[0] ? 1 : 0, d.auto.OC[1]], DC: [d.auto.DC[0] ? 1 : 0, d.auto.DC[1]] },
+    };
+    const ov = Object.entries(d.ov).map(([k, v]) => [Number(k), Number(v)]);
+    const nil = Object.entries(d.nil).map(([k, v]) => [Number(k), Number(v)]);
+    const prom = Object.entries(d.prom).map(([k, v]) => [Number(k), v]);
+    if (ov.length) rec.ov = ov;
+    if (nil.length) rec.nil = nil;
+    if (prom.length) rec.prom = prom;
+    if (d.pwo.length) rec.pwo = d.pwo;
+    o.rec = rec;
+  }
+  if (secs.includes("depth")) {
+    const dep = {};
+    Object.entries(d.locks).forEach(([pos, ids]) => (dep[pos] = ids));
+    Object.keys(B.gameday.locks || {}).forEach((pos) => { if (!d.locks[pos]) dep[pos] = "staff"; });
+    if (Object.keys(dep).length) o.depth = dep;
+  }
+  if (secs.includes("plan")) o.plan = { focus: d.plan.focus, off: d.plan.off, def: d.plan.def, script: d.plan.script ? 1 : 0 };
+  if (secs.includes("calls")) o.calls = { off: d.calls.off, def: d.calls.def };
+  return o;
+}
+
+function myCode(el) {
+  const d = S.draft, B = S.B, p = planHours(), o = buildOrders();
+  const cut = p.rows.filter((r) => r.status.startsWith("cut")).length;
+  const lines = [];
+  if (o.rec) {
+    lines.push(`${o.rec.q.length} standing orders, ${p.used} of ${p.avail} hours planned`);
+    if (o.rec.add.length || o.rec.drop.length) lines.push(`Board: ${o.rec.add.length} added, ${o.rec.drop.length} removed`);
+    ["ov", "nil", "prom", "pwo"].forEach((k) => o.rec[k] && lines.push(`${{ ov: "Official visits", nil: "NIL offers", prom: "Promises", pwo: "Walk-on invites" }[k]}: ${o.rec[k].length}`));
+  }
+  if (o.plan) lines.push(`Practice: ${o.plan.focus === "staff" ? "the staff's call" : S.rules.focus[o.plan.focus].label}; offense: ${o.plan.off === "film" ? "the film's read" : S.rules.offKeys[o.plan.off].label}; defense: ${o.plan.def === "film" ? "the film's read" : S.rules.defKeys[o.plan.def].label}`);
+  if (o.calls) lines.push(`Play-calling: offense ${o.calls.off === "HC" ? "you" : "your OC"}, defense ${o.calls.def === "HC" ? "you" : "your DC"}`);
+  if (o.depth) lines.push(`Depth chart: ${Object.entries(o.depth).map(([k, v]) => `${k} ${v === "staff" ? "back to the staff" : "your order"}`).join(", ")}`);
+  el.innerHTML = `<section class="panel"><h2>Cycle ${B.cycle} orders</h2>
+    ${Object.keys(o).length ? `<ul>${lines.map((l) => `<li>${esc(l)}</li>`).join("")}</ul>` : `<p class="muted">No orders are open this cycle.</p>`}
+    ${cut ? `<div class="note">${cut} standing order${cut === 1 ? "" : "s"} won't fit in this week's hours and will be cut. Reorder or remove some, or keep them for next week.</div>` : ""}
+    ${d.board.length > S.rules.boardMax ? `<div class="note bad">Your board is over ${S.rules.boardMax}.</div>` : ""}
+    <div class="controls" style="margin-top:12px"><button class="btn go" id="build" ${Object.keys(o).length ? "" : "disabled"}>Build my code</button>
+      <button class="btn ghost" id="reset">Start over from last cycle's orders</button></div>
+    <div id="out" class="codebox"></div></section>
+    <p class="quiet" style="margin-top:14px">Your code is signed with your team's key. Build it again after any change: only the newest code you submit counts.</p>`;
+  $("#build").onclick = async () => {
+    try {
+      const code = await signCode(B, o);
+      $("#out").innerHTML = `<label for="code" class="quiet">Your code (${code.length} characters)</label><textarea id="code" rows="6" readonly>${esc(code)}</textarea>
+        <div class="controls" style="margin-top:8px"><button class="btn go" id="copy">Copy code</button>${S.manifest.formUrl ? `<a class="btn" href="${esc(S.manifest.formUrl)}" target="_blank" rel="noopener">Open the submission form</a>` : `<span class="quiet">Paste it where the commissioner asked.</span>`}</div>`;
+      $("#copy").onclick = async () => {
+        const ta = $("#code");
+        try { await navigator.clipboard.writeText(ta.value); } catch (e) { ta.select(); document.execCommand("copy"); }
+        $("#copy").textContent = "Copied";
+      };
+    } catch (e) { $("#out").innerHTML = `<div class="note bad">${esc(e.message)}</div>`; }
+  };
+  $("#reset").onclick = () => {
+    if (!confirm("Throw away this cycle's changes and start from the orders already in force?")) return;
+    S.draft = freshDraft(B); saveDraft(); viewMy("code");
+  };
+}
+
+// ═══ Start ═════════════════════════════════════════════════════════════════
+
+async function start() {
+  const theme = store.get("cc-theme");
+  if (theme) document.documentElement.dataset.theme = theme;
+  try {
+    const r = await fetch(`data/manifest.json?t=${Date.now()}`);
+    if (!r.ok) throw new Error("The league data isn't here yet. Ask the commissioner to export the site.");
+    S.manifest = await r.json();
+    S.rules = await getJSON("rules.json");
+  } catch (e) { app().innerHTML = `<div class="note bad">${esc(e.message)}</div>`; return; }
+  S.manifest.teams.forEach((t) => (S.teamById[t.id] = t));
+  document.title = S.manifest.title;
+  $("#league-title").textContent = S.manifest.title;
+  $("#foot").textContent = `${S.manifest.title} · cycle ${S.manifest.cycle} · league ${S.manifest.league}`;
+  renderStrip();
+  const saved = sess.get("cc-login");
+  if (saved) { try { await login(saved.id, saved.pw); } catch (e) { sess.del("cc-login"); } }
+  renderWho();
+  window.addEventListener("hashchange", route);
+  route();
+}
+start();
