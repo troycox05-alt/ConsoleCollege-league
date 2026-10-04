@@ -233,3 +233,33 @@ footer { max-width: 1180px; margin: 0 auto; padding: 0 16px 40px; color: var(--i
 .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
 .pager { display: flex; gap: 10px; align-items: center; margin-top: 12px; }
 .loading { padding: 40px 0; color: var(--ink-3); }
+
+/* ── Coach Career detail: cards, the race, stat groups, captured screens ── */
+.small { font-size: 13px; }
+.facts { list-style: none; padding: 0; margin: 12px 0 0; display: grid; gap: 4px; }
+.facts .k { display: inline-block; min-width: 120px; color: var(--ink-3); font-size: 14px; }
+.kv { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 10px 18px; margin: 12px 0 0; }
+.kv > div { min-width: 0; }
+.kv dt { color: var(--ink-3); font-size: 13px; }
+.kv dd { margin: 0; }
+.kv.wide { grid-template-columns: 1fr; }
+.kv.wide > div { display: grid; grid-template-columns: minmax(120px, 180px) 1fr; gap: 12px; }
+.kv-strip { display: flex; flex-wrap: wrap; gap: 6px 22px; padding: 10px 0; border-bottom: 1px solid var(--chalk); margin-bottom: 8px; }
+.race { display: grid; gap: 6px; margin: 8px 0; }
+.race-row { display: grid; grid-template-columns: minmax(110px, 160px) 1fr 34px; gap: 10px; align-items: center; }
+.race-row .bar { height: 10px; background: var(--chalk-2); border-radius: 5px; overflow: hidden; }
+.race-row .bar i { display: block; height: 100%; background: var(--ink-3); }
+.race-row.me .bar i { background: var(--turf); }
+.race-row.me a { font-weight: 600; }
+.statgrp { margin: 10px 0; }
+.statgrp h4 { margin: 0 0 4px; font-family: var(--display); font-size: 16px; color: var(--ink-2); }
+.statgrp dl { display: flex; flex-wrap: wrap; gap: 4px 18px; margin: 0; }
+.statgrp dt { color: var(--ink-3); font-size: 12px; }
+.statgrp dd { margin: 0; font-family: var(--display); font-size: 18px; font-weight: 600; }
+.tl { padding: 8px 0; border-bottom: 1px solid var(--chalk); }
+.tl ul { margin: 4px 0; }
+pre.screen { font: 12.5px/1.35 ui-monospace, "SF Mono", Menlo, Consolas, monospace; background: var(--panel); border: 1px solid var(--chalk);
+  border-radius: var(--radius-m); padding: 12px; overflow-x: auto; white-space: pre; color: var(--ink); }
+td.tags .tag { margin: 1px 0; }
+tr.starter-row td:first-child { box-shadow: inset 3px 0 0 var(--turf); }
+.grid > section + section { margin-top: 0; }

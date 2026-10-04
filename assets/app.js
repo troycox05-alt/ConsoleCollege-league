@@ -27,7 +27,7 @@ const rk = (r) => (r ? `<span class="rk">${r}</span>` : "");
 
 async function getJSON(path) {
   if (S.cache[path]) return S.cache[path];
-  const r = await fetch(`data/${path}?c=${S.manifest ? S.manifest.cycle : Date.now()}`);
+  const r = await fetch(`data/${path}?c=${S.manifest ? S.manifest.build || S.manifest.cycle : Date.now()}`);
   if (!r.ok) throw new Error(`Couldn't load ${path} (${r.status}).`);
   return (S.cache[path] = await r.json());
 }
@@ -60,7 +60,7 @@ async function deflate(bytes) {
 
 async function unlockTeam(id, password) {
   if (!window.crypto || !crypto.subtle) throw new Error("This browser can't unlock team files here. Open the site over https.");
-  const r = await fetch(`data/private/${id}.bin?c=${S.manifest.cycle}`);
+  const r = await fetch(`data/private/${id}.bin?c=${S.manifest.build || S.manifest.cycle}`);
   if (!r.ok) throw new Error("That program has no locked file this cycle. It may be a CPU team.");
   const buf = new Uint8Array(await r.arrayBuffer());
   if (String.fromCharCode(...buf.slice(0, 4)) !== "CCX1") throw new Error("That team file is damaged. Ask the commissioner to export again.");
@@ -221,7 +221,7 @@ function showMeter(on) {
 const routes = [
   [/^$/, viewHome], [/^scores(?:\/(\d+))?$/, viewScores], [/^standings$/, viewStandings], [/^polls$/, viewPolls],
   [/^recruits$/, viewRecruits], [/^recruit\/(\d+)$/, viewRecruit], [/^teams$/, viewTeams], [/^team\/([\w-]+)$/, viewTeam],
-  [/^directory$/, viewDirectory], [/^login$/, viewLogin], [/^my(?:\/(\w+))?$/, viewMy],
+  [/^directory$/, viewDirectory], [/^login$/, viewLogin], [/^my\/player\/(\d+)$/, viewMyPlayer], [/^my(?:\/(\w+))?$/, viewMy],
 ];
 
 async function route() {
@@ -303,10 +303,11 @@ async function viewStandings() {
 }
 
 async function viewPolls() {
-  const p = await getJSON("polls.json");
+  const [p, cls] = await Promise.all([getJSON("polls.json"), getJSON("classes.json").catch(() => [])]);
   app().innerHTML = `<h1>Polls</h1><p class="muted">${esc(p.label)}</p><div class="grid" style="margin-top:18px">
     <section><h2>Media top 25</h2>${pollTable(p.poll)}</section>
     ${p.cfp.length ? `<section><h2>Playoff committee</h2><div class="table-wrap"><table><tbody>${p.cfp.map((r) => `<tr><td class="num tight">${r.rank}</td><td>${teamLink(r.id)}</td></tr>`).join("")}</tbody></table></div></section>` : ""}
+    ${cls.length ? `<section><h2>Recruiting classes</h2><div class="table-wrap"><table><thead><tr><th class="tight">#</th><th>Team</th><th class="r">Commits</th><th class="r">Avg</th><th class="r">5★/4★</th></tr></thead><tbody>${cls.slice(0, 25).map((c) => `<tr class="${S.B && S.B.id === c.id ? "mine" : ""}"><td class="num">${c.rank || ""}</td><td>${teamLink(c.id)}</td><td class="r num">${c.n}</td><td class="r num">${c.avg.toFixed(2)}</td><td class="r num">${c.five}/${c.four}</td></tr>`).join("")}</tbody></table></div></section>` : ""}
     ${p.heisman.length ? `<section><h2>Award watch</h2><div class="table-wrap"><table><tbody>${p.heisman.map((h, i) => `<tr><td class="num tight">${i + 1}</td><td>${esc(h.name)}</td><td>${esc(h.pos)}</td><td>${esc(h.school)}</td></tr>`).join("")}</tbody></table></div></section>` : ""}
     </div>`;
 }
@@ -317,11 +318,22 @@ function statusOf(r) {
   return `<span class="quiet">Open</span>`;
 }
 
+function scanMap() {
+  if (!S.B) return null;
+  if (!S.B._scan) { S.B._scan = {}; (S.B.recruiting.scan || []).forEach((x) => (S.B._scan[x[0]] = { proj: x[1], st: x[2], fit: x[3], why: x[4] })); }
+  return S.B._scan;
+}
+const FIT_TAG = { "IN-STATE": "good", "REGION": "good", "SCHEME FIT": "good", "INTERESTED": "good", "SLEEPER": "warn", "REACH": "warn",
+  "STAFF PRIORITY": "warn", "HARD SELL": "bad", "COMMITTED": "", "OUT OF REGION": "" };
+const fitTags = (why) => (why || []).map((w) => `<span class="tag ${w.startsWith("NEED") ? "bad" : FIT_TAG[w] || ""}">${esc(w)}</span>`).join(" ");
+
 async function viewRecruits(q) {
   const all = await loadRecruits();
+  const sc = scanMap();
   const f = {
     text: q.get("q") || "", pos: q.get("pos") || "", st: q.get("st") || "", stars: q.get("stars") || "",
     status: q.get("status") || "", board: q.get("board") === "1", page: Number(q.get("page") || 1),
+    sort: q.get("sort") || (S.B ? "fit" : "rank"),
   };
   const states = [...new Set(all.map((r) => r.st))].sort();
   const board = S.draft ? new Set(S.draft.board) : new Set();
@@ -329,32 +341,38 @@ async function viewRecruits(q) {
     (!f.text || r.n.toLowerCase().includes(f.text.toLowerCase()) || (r.hs || "").toLowerCase().includes(f.text.toLowerCase())) &&
     (!f.pos || r.p === f.pos) && (!f.st || r.st === f.st) && (!f.stars || String(r.s) === f.stars) &&
     (!f.status || (f.status === "open" ? !r.c : !!r.c)) && (!f.board || board.has(r.id)));
+  const PROJ_ORDER = ["AA", "STAR", "QS", "STR", "ROT", "BU", "DEV", "LS"];
+  const projKey = (r) => { const p = sc && sc[r.id] ? sc[r.id].proj.split("-") : ["LS"]; return PROJ_ORDER.indexOf(p[p.length - 1]) * 10 + PROJ_ORDER.indexOf(p[0]); };
+  if (sc && f.sort === "fit") rows = [...rows].sort((a, b) => ((sc[b.id] || {}).fit ?? -99) - ((sc[a.id] || {}).fit ?? -99));
+  else if (sc && f.sort === "proj") rows = [...rows].sort((a, b) => projKey(a) - projKey(b) || (a.r || 99999) - (b.r || 99999));
   const per = 50, pages = Math.max(1, Math.ceil(rows.length / per)), page = Math.min(f.page, pages);
   const shown = rows.slice((page - 1) * per, page * per);
-  const qs = (o) => "#/recruits?" + new URLSearchParams({ ...{ q: f.text, pos: f.pos, st: f.st, stars: f.stars, status: f.status, board: f.board ? "1" : "", page: String(page) }, ...o }).toString();
-  app().innerHTML = `<h1>Recruits</h1><p class="muted">${all.length.toLocaleString()} prospects in this class. Ratings are never shown: stars are public, and your staff's read comes from evaluating him.</p>
+  const qs = (o) => "#/recruits?" + new URLSearchParams({ ...{ q: f.text, pos: f.pos, st: f.st, stars: f.stars, status: f.status, board: f.board ? "1" : "", sort: f.sort, page: String(page) }, ...o }).toString();
+  app().innerHTML = `<h1>Recruits</h1><p class="muted">${all.length.toLocaleString()} prospects in this class. Stars and rankings are public. ${S.B ? "Projection is your staff's read: the more you evaluate him, the tighter it gets." : "Log in to see your staff's projection and where you stand."}</p>
     <form class="controls" id="rf" style="margin-top:14px">
       <input type="text" name="q" placeholder="Name or high school" value="${esc(f.text)}" aria-label="Search">
       <select name="pos" aria-label="Position"><option value="">All positions</option>${S.rules.positions.map((p) => `<option ${p === f.pos ? "selected" : ""}>${p}</option>`).join("")}</select>
       <select name="stars" aria-label="Stars"><option value="">All stars</option>${[5, 4, 3, 2, 1].map((s) => `<option value="${s}" ${String(s) === f.stars ? "selected" : ""}>${s} star</option>`).join("")}</select>
       <select name="st" aria-label="State"><option value="">All states</option>${states.map((s) => `<option ${s === f.st ? "selected" : ""}>${esc(s)}</option>`).join("")}</select>
       <select name="status" aria-label="Status"><option value="">Open and committed</option><option value="open" ${f.status === "open" ? "selected" : ""}>Still open</option><option value="committed" ${f.status === "committed" ? "selected" : ""}>Committed</option></select>
-      ${S.B ? `<label><input type="checkbox" name="board" value="1" ${f.board ? "checked" : ""}> My board only</label>` : ""}
+      ${S.B ? `<select name="sort" aria-label="Sort"><option value="fit" ${f.sort === "fit" ? "selected" : ""}>Suggested for you</option><option value="rank" ${f.sort === "rank" ? "selected" : ""}>National rank</option><option value="proj" ${f.sort === "proj" ? "selected" : ""}>Your projection</option></select>
+        <label><input type="checkbox" name="board" value="1" ${f.board ? "checked" : ""}> My board only</label>` : ""}
       <button class="btn" type="submit">Show</button>
     </form>
-    <div class="table-wrap"><table><thead><tr><th class="tight">Rank</th><th>Name</th><th>Pos</th><th>Stars</th><th>Size</th><th>From</th><th>Status</th><th class="r">Offers</th>${S.B ? "<th>Your staff</th><th></th>" : ""}</tr></thead><tbody>
+    <div class="table-wrap"><table><thead><tr><th class="tight">Rank</th><th>Name</th><th>Pos</th><th>Stars</th>${S.B ? "<th>Proj</th>" : ""}<th>Size</th><th>From</th><th>Status</th><th class="r">Offers</th>${S.B ? "<th>You</th><th>Why</th><th></th>" : ""}</tr></thead><tbody>
     ${shown.map((r) => {
-      const k = known(r.id);
+      const x = sc ? sc[r.id] || {} : {};
       return `<tr class="${board.has(r.id) ? "mine" : ""}"><td class="num">${r.r || ""}</td><td><a href="#/recruit/${r.id}">${esc(r.n)}</a>${r.k !== "hs" ? ` <span class="tag">${r.k === "juco" ? "JUCO" : "Intl"}</span>` : ""}</td>
-        <td>${r.p}</td><td>${stars(r.s)}</td><td class="quiet">${esc(r.ht)} ${r.wt || ""}</td><td>${esc(r.st)}<span class="quiet"> ${esc(r.hs)}</span></td><td>${statusOf(r)}</td><td class="r num">${r.of.length}</td>
-        ${S.B ? `<td class="quiet">${k ? esc(k.standing) : ""}</td><td>${S.manifest.sections.includes("rec") && !r.sg ? `<button class="btn small" data-board="${r.id}">${board.has(r.id) ? "Remove" : "Add to board"}</button>` : ""}</td>` : ""}</tr>`;
-    }).join("") || `<tr><td colspan="9" class="empty">No recruits match. Clear a filter.</td></tr>`}
+        <td>${r.p}</td><td>${stars(r.s)}</td>${S.B ? `<td class="num">${esc(x.proj || "")}</td>` : ""}<td class="quiet">${esc(r.ht)} ${r.wt || ""}</td><td>${esc(r.st)}<span class="quiet"> ${esc(r.hs)}</span></td><td>${statusOf(r)}</td><td class="r num">${r.of.length}</td>
+        ${S.B ? `<td class="quiet">${esc(x.st || "no contact")}</td><td class="tags">${fitTags(x.why)}</td><td>${S.manifest.sections.includes("rec") && !r.sg ? `<button class="btn small" data-board="${r.id}">${board.has(r.id) ? "Remove" : "Add to board"}</button>` : ""}</td>` : ""}</tr>`;
+    }).join("") || `<tr><td colspan="12" class="empty">No recruits match. Clear a filter.</td></tr>`}
     </tbody></table></div>
+    ${S.B ? `<p class="quiet" style="margin-top:8px">Proj: LS long shot · DEV developmental · BU backup · ROT rotation · STR starter · QS quality starter · STAR · AA All-American</p>` : ""}
     <div class="pager"><a class="btn small ${page <= 1 ? "ghost" : ""}" href="${qs({ page: String(Math.max(1, page - 1)) })}">Previous</a><span class="quiet">Page ${page} of ${pages} · ${rows.length.toLocaleString()} recruits</span><a class="btn small ${page >= pages ? "ghost" : ""}" href="${qs({ page: String(Math.min(pages, page + 1)) })}">Next</a></div>`;
   $("#rf").onsubmit = (ev) => {
     ev.preventDefault();
     const fd = new FormData(ev.target);
-    location.hash = "#/recruits?" + new URLSearchParams({ q: fd.get("q") || "", pos: fd.get("pos") || "", st: fd.get("st") || "", stars: fd.get("stars") || "", status: fd.get("status") || "", board: fd.get("board") ? "1" : "", page: "1" });
+    location.hash = "#/recruits?" + new URLSearchParams({ q: fd.get("q") || "", pos: fd.get("pos") || "", st: fd.get("st") || "", stars: fd.get("stars") || "", status: fd.get("status") || "", board: fd.get("board") ? "1" : "", sort: fd.get("sort") || f.sort, page: "1" });
   };
   app().onclick = (ev) => {
     const b = ev.target.closest("[data-board]");
@@ -373,42 +391,84 @@ function toggleBoard(rid) {
   saveDraft();
 }
 
+const money = (n) => (n >= 1e6 ? `$${(n / 1e6).toFixed(n >= 1e7 ? 0 : 1)}M` : n >= 1000 ? `$${Math.round(n / 1000)}K` : `$${n || 0}`);
+
+async function recruitDetail(id) {
+  try { return (await getJSON(`rd/${Number(id) % 16}.json`))[id] || {}; } catch (e) { return {}; }
+}
+
 async function viewRecruit(id) {
   await loadRecruits();
   const r = S.recById[Number(id)];
   if (!r) { app().innerHTML = `<p class="empty">That recruit isn't in this class.</p>`; return; }
+  const D = await recruitDetail(r.id);
   const k = known(r.id);
+  const x = (scanMap() || {})[r.id] || {};
   const onBoard = S.draft && S.draft.board.includes(r.id);
   const open = S.B && S.manifest.sections.includes("rec") && !r.sg;
+  const first = esc(r.n.split(" ")[0]);
+  const facts = [];
+  if (D.or) facts.push(`<li><span class="k">From</span>${esc(D.or)}, ${esc(r.st)}</li>`);
+  if (D.ss) facts.push(`<li><span class="k">${D.hsk === "hs" ? "Senior season" : "This season"}</span>${esc(D.ss)}</li>`);
+  facts.push(`<li><span class="k">Official visits</span>${D.ov && D.ov.length ? D.ov.map(([t, w]) => `${teamLink(t)} (Wk ${w})`).join(", ") : "none yet"} <span class="quiet">(${(D.ov || []).length} of ${S.rules.ovMax})</span></li>`);
+  if (D.cb) facts.push(`<li><span class="k">Crystal ball</span>${teamLink(D.cb[0])} ${D.cb[1]}%</li>`);
+  if (D.cw) facts.push(`<li><span class="k">Commitment</span>${esc(D.cw)}</li>`);
   let staff = "";
   if (S.B) {
     const d = S.draft;
     const pri = Object.entries(S.rules.priorities);
-    staff = `<section class="panel" style="margin-top:20px"><h2>Your staff on ${esc(r.n.split(" ")[0])}</h2>
-      ${k ? `<p><b>${esc(k.standing)}</b>${k.mine ? " · committed to you" : ""}${k.offered ? " · you've offered" : ""}</p>
-        <p>${k.proj ? `Staff projection: <b>${esc(k.proj)}</b> (evaluated ${k.scout} of 3)` : "Not evaluated yet. Queue an evaluation; your staff's read shows up next week."}</p>
-        <p>${k.knows.length ? `What he cares about: <b>${k.knows.map(esc).join(", ")}</b>` : "You don't know what he cares about yet. Evaluations and conversations reveal it."}</p>
-        ${k.ov ? `<p>Official visit set for Week ${k.ov}.</p>` : ""}${k.nil ? `<p>Your NIL offer: $${k.nil.toLocaleString()}/yr</p>` : ""}${k.promise ? `<p>You promised: ${esc((S.rules.promises[k.promise] || {}).label || k.promise)}</p>` : ""}
-        ${k.log.length ? `<p class="quiet">${k.log.map(esc).join("<br>")}</p>` : ""}` : `<p class="muted">Your staff hasn't worked him yet.</p>`}
-      ${open ? `<div class="controls" style="margin-top:12px"><button class="btn ${onBoard ? "" : "go"}" id="tb">${onBoard ? "Remove from board" : "Add to board"}</button></div>
-        ${onBoard ? `<h3 style="margin-top:14px">Add a standing order</h3>
-        <div class="controls"><select id="qa">${Object.entries(S.rules.actions).map(([a, v]) => `<option value="${a}">${esc(v.label)} (${S.B.recruiting.costs[a]}h)</option>`).join("")}</select>
-          <select id="qr">${Object.entries(S.rules.queueRules).map(([a, v]) => `<option value="${a}">${esc(v.replace("{n}", "N"))}</option>`).join("")}</select>
-          <select id="qp"><option value="auto">Pitch: best we know</option>${pri.map(([a, v]) => `<option value="${a}">Pitch: ${esc(v)}</option>`).join("")}</select>
-          <button class="btn" id="qadd">Add to queue</button></div>
-        <h3 style="margin-top:14px">This week only</h3>
-        <div class="controls">
-          <select id="ovw" ${(k && k.canOv) || d.queue.some((e) => e.rid === r.id && e.act === "offer") ? "" : "disabled"}><option value="">Official visit: none</option>${S.B.recruiting.homeGames.map((g) => `<option value="${g.week}" ${d.ov[r.id] == g.week ? "selected" : ""}>Week ${g.week} vs ${esc(g.opp)}</option>`).join("")}</select>
-          <label>NIL $/yr <input type="number" id="nil" min="0" step="5000" value="${d.nil[r.id] ?? (k ? k.nil : 0)}"></label>
-          <select id="prom" ${k && k.promise ? "disabled" : ""}><option value="">Promise: none</option>${Object.entries(S.rules.promises).map(([a, v]) => `<option value="${a}" ${d.prom[r.id] === a ? "selected" : ""}>${esc(v.label)} (${v.cost}h)</option>`).join("")}</select>
-          ${S.B.recruiting.pwoOpen && r.s <= 2 ? `<label><input type="checkbox" id="pwo" ${d.pwo.includes(r.id) ? "checked" : ""}> Preferred walk-on</label>` : ""}
-          <button class="btn" id="once">Save</button></div>
-        ${k && k.whyOv && !k.canOv ? `<p class="quiet">Visit: ${esc(k.whyOv)}</p>` : ""}${k && k.whyPromise ? `<p class="quiet">Promise: ${esc(k.whyPromise)}</p>` : ""}` : ""}` : ""}
-      </section>`;
+    const race = k && k.race && k.race.length ? k.race : null;
+    const top = race ? Math.max(...race.map((z) => z[1]), 1) : 1;
+    const nil = (k && k.nilPanel) || null;
+    staff = `<div class="grid" style="margin-top:22px">
+      <section class="panel"><h2>Scouting report</h2>
+        <p>Projection: <b>${esc(k ? k.projWords : "")}</b>${k && k.proj ? ` <span class="quiet">(${esc(k.proj)})</span>` : ""}</p>
+        <p class="quiet">Scouted ${k ? k.scout : 0} of 3. Every evaluation tightens the read; it shows after the week is played.</p>
+        <h3 style="margin-top:12px">What he wants</h3>
+        <ol>${(k ? k.wants : [null, null, null]).map((w) => w ? `<li><b>${esc(w)}</b></li>` : `<li class="quiet">??? (evaluate him, or pitch it and see)</li>`).join("")}</ol>
+        ${k && k.reads ? `<p>Reads as: <b>${esc(k.reads)}</b></p>` : ""}
+        ${x.why && x.why.length ? `<p>${fitTags(x.why)}</p>` : ""}
+        ${k && k.pipeline ? `<p>Pipeline at ${esc(r.hs)}: <b>${esc(k.pipeline)}</b></p>` : ""}
+      </section>
+      <section class="panel"><h2>The race</h2>
+        <p>You: <b>${esc(k ? k.standing : "No contact yet")}</b> · offer ${k && k.offered ? `<span class="tag good">yes</span>` : `<span class="tag bad">no</span>`} · ${r.of.length} offers out</p>
+        ${race ? `<div class="race">${race.map(([t, v]) => `<div class="race-row ${t === S.B.id ? "me" : ""}"><span>${teamLink(t)}</span><span class="bar"><i style="width:${Math.round((v / top) * 100)}%"></i></span><span class="num">${v}</span></div>`).join("")}</div>
+          <p class="quiet">Interest runs 0 to 100.${top < 25 ? " Early days: nobody has a real hold yet." : ""}</p>` : `<p class="muted">Nobody's in on him yet.</p>`}
+        ${k && k.warn ? `<div class="note bad">${esc(k.warn)}</div>` : ""}
+      </section>
+      <section class="panel"><h2>NIL</h2>
+        ${nil ? `<p>Market for a ${r.s}-star: about <b>${money(nil.market)}/yr</b> <span class="quiet">(budgets like yours pay about ${money(nil.yours)})</span></p>
+        <p>Your offer: <b>${k.nil ? money(k.nil) + "/yr" : "none"}</b> · free to offer ${money(S.B.recruiting.nilLeft)}</p>
+        <p>${nil.others ? `Other NIL offers: ${nil.others}, reportedly as high as ${money(nil.high)}/yr (${teamLink(nil.highBy)})` : "Nobody else has put NIL money on the table."}</p>
+        <p class="quiet">${esc(nil.appetite || "Evaluate him to find out how much money matters to him.")}</p>` : `<p class="muted">Work him first to learn the NIL picture.</p>`}
+      </section>
+      <section class="panel"><h2>His room</h2><p>${esc(k ? k.room : "")}</p>
+        ${k && k.promise ? `<p>Your promise: <b>${esc((S.rules.promises[k.promise] || {}).label || k.promise)}</b></p>` : ""}
+        ${k && k.pitches && k.pitches.length ? `<h3 style="margin-top:12px">Your pitch</h3><table><tbody>${k.pitches.map(([p, w]) => `<tr><td>${esc(S.rules.priorities[p] || p)}${k.knowsKeys.includes(p) ? ` <span class="tag good">he cares</span>` : ""}</td><td class="quiet">${esc(w)}</td></tr>`).join("")}</tbody></table>` : ""}
+      </section>
+    </div>
+    ${k && k.log.length ? `<section style="margin-top:20px"><h2>Your history with ${first}</h2><ul>${k.log.map((l) => `<li>${esc(l)}</li>`).join("")}</ul></section>` : ""}
+    ${open ? `<section class="panel" style="margin-top:22px"><h2>Orders on ${first}</h2>
+      <div class="controls"><button class="btn ${onBoard ? "" : "go"}" id="tb">${onBoard ? "Remove from board" : "Add to board"}</button></div>
+      ${onBoard ? `<h3 style="margin-top:14px">Add a standing order</h3>
+      <div class="controls"><select id="qa">${Object.entries(S.rules.actions).map(([a, v]) => `<option value="${a}">${esc(v.label)} (${S.B.recruiting.costs[a]}h)</option>`).join("")}</select>
+        <select id="qr">${Object.entries(S.rules.queueRules).map(([a, v]) => `<option value="${a}">${esc(v.replace("{n}", "N"))}</option>`).join("")}</select>
+        <select id="qp"><option value="auto">Pitch: best we know</option>${pri.map(([a, v]) => `<option value="${a}">Pitch: ${esc(v)}</option>`).join("")}</select>
+        <button class="btn" id="qadd">Add to queue</button></div>
+      <h3 style="margin-top:14px">This week only</h3>
+      <div class="controls">
+        <select id="ovw" ${(k && k.canOv) || d.queue.some((e) => e.rid === r.id && e.act === "offer") ? "" : "disabled"}><option value="">Official visit: none</option>${S.B.recruiting.homeGames.map((g) => `<option value="${g.week}" ${d.ov[r.id] == g.week ? "selected" : ""}>Week ${g.week} vs ${esc(g.opp)}</option>`).join("")}</select>
+        <label>NIL $/yr <input type="number" id="nil" min="0" step="5000" value="${d.nil[r.id] ?? (k ? k.nil : 0)}"></label>
+        <select id="prom" ${k && k.promise ? "disabled" : ""}><option value="">Promise: none</option>${Object.entries(S.rules.promises).map(([a, v]) => `<option value="${a}" ${d.prom[r.id] === a ? "selected" : ""}>${esc(v.label)} (${v.cost}h)</option>`).join("")}</select>
+        ${S.B.recruiting.pwoOpen && r.s <= 2 ? `<label><input type="checkbox" id="pwo" ${d.pwo.includes(r.id) ? "checked" : ""}> Preferred walk-on</label>` : ""}
+        <button class="btn" id="once">Save</button></div>
+      ${k && k.whyOv && !k.canOv ? `<p class="quiet">Visit: ${esc(k.whyOv)}</p>` : ""}${k && k.whyPromise ? `<p class="quiet">Promise: ${esc(k.whyPromise)}</p>` : ""}` : ""}
+    </section>` : ""}`;
   }
-  app().innerHTML = `<p><a href="#/recruits">Recruits</a></p><h1>${esc(r.n)}</h1>
+  app().innerHTML = `<p><a href="#/recruits">Recruits</a></p><h1>${esc(r.n)}${D.gen ? ` <span class="tag warn">Generational</span>` : ""}</h1>
     <p class="muted">${r.p} · ${stars(r.s)} · ${r.r ? `No. ${r.r} nationally, ${r.pr} at ${r.p}` : "unranked"} · ${esc(r.ht)} ${r.wt || ""} · ${esc(r.hs)} (${esc(r.st)})</p>
     <p>${statusOf(r)}</p>
+    <ul class="facts">${facts.join("")}</ul>
     <div class="grid" style="margin-top:16px">
       <section><h2>Offers</h2>${r.of.length ? `<div class="schools">${r.of.map(teamLink).join("")}</div>` : `<p class="muted">No offers yet.</p>`}</section>
       <section><h2>Top schools</h2>${r.top.length ? `<ol>${r.top.map((t) => `<li>${teamLink(t)}</li>`).join("")}</ol>` : `<p class="muted">No favorites yet.</p>`}</section>
@@ -489,7 +549,7 @@ async function viewMy(tab) {
   if (!S.B) { location.hash = "#/login"; return; }
   await loadRecruits();
   tab = tab || "recruiting";
-  const tabs = [["recruiting", "Recruiting"], ["gameday", "Game day"], ["roster", "Roster"], ["coach", "Coach"], ["code", "Code"]];
+  const tabs = [["recruiting", "Recruiting"], ["gameday", "Game day"], ["roster", "Roster"], ["coach", "Program"], ["code", "Code"]];
   const head = `<h1>${esc(S.B.team)}</h1><nav class="subnav" aria-label="My team">${tabs.map(([k, v]) => `<a href="#/my/${k}" class="${k === tab ? "on" : ""}">${v}</a>`).join("")}</nav>`;
   const fn = { recruiting: myRecruiting, gameday: myGameday, roster: myRoster, coach: myCoach, code: myCode }[tab] || myRecruiting;
   app().innerHTML = head + `<div id="mybody"></div>`;
@@ -513,6 +573,7 @@ function myRecruiting(el) {
   el.innerHTML = `
     ${!open ? `<div class="note">${esc(S.manifest.note || "Recruiting orders aren't open this cycle.")}</div>` : ""}
     <p class="muted">${R.hours.phase} week: <b>${R.hours.total}</b> staff hours${d.plan.focus === "recruit" ? ` plus ${S.rules.focus.recruit.hours} from a recruiting-week practice plan` : ""}. Orders run top to bottom; anything that doesn't fit is cut. What your staff learns shows up after the week is played.</p>
+    ${R.class ? `<div class="kv-strip"><span>Class rank <b>${R.class.rank ? "No. " + R.class.rank : "unranked"}</b></span><span>Commits <b>${R.classSize}${R.class.cap ? " of " + R.class.cap : ""}</b></span><span>Average <b>${R.class.avg ? R.class.avg.toFixed(2) + "★" : "none"}</b></span><span>NIL free <b>${money(R.nilLeft)}</b></span><span class="quiet">${esc(R.class.needs)}</span></div>` : ""}
     ${lw.week ? `<div class="note good">Last week: ${lw.ran.length} orders ran${lw.cut.length ? `, ${lw.cut.length} cut for hours` : ""}${lw.done.length ? `, ${lw.done.length} finished` : ""}.</div>` : ""}
     <section><h2>Standing orders</h2>
       <div id="queue">${d.queue.length ? p.rows.map((r, i) => `<div class="queue-row ${r.status === "runs" ? "" : "cut"}">
@@ -533,7 +594,7 @@ function myRecruiting(el) {
       <div class="table-wrap"><table><thead><tr><th>Name</th><th>Pos</th><th>Stars</th><th>Status</th><th>Where you stand</th><th>Staff projection</th><th>He cares about</th><th></th></tr></thead><tbody>
       ${d.board.map((rid) => { const r = S.recById[rid] || {}; const k = known(rid) || {}; return `<tr><td><a href="#/recruit/${rid}">${esc(r.n)}</a></td><td>${r.p || ""}</td><td>${stars(r.s)}</td><td>${r.c ? statusOf(r) : `<span class="quiet">Open</span>`}</td>
         <td>${esc(k.standing || "No contact yet")}${k.offered ? ` <span class="tag good">offered</span>` : ""}${d.ov[rid] ? ` <span class="tag">visit wk ${d.ov[rid]}</span>` : k.ov ? ` <span class="tag">visit wk ${k.ov}</span>` : ""}</td>
-        <td>${esc(k.proj || "not evaluated")}</td><td class="quiet">${(k.knows || []).map(esc).join(", ")}</td>
+        <td>${esc(((scanMap() || {})[rid] || {}).proj || "")}${k.proj ? ` <span class="quiet">${esc(k.proj)}</span>` : ""}</td><td class="quiet">${(k.knows || []).map(esc).join(", ")}</td>
         <td>${open ? `<button class="btn small ghost" data-rm="${rid}">Remove</button>` : ""}</td></tr>`; }).join("") || `<tr><td colspan="8" class="empty">Your board is empty.</td></tr>`}
       </tbody></table></div></section>`;
   el.onchange = (ev) => {
@@ -560,6 +621,28 @@ function myRecruiting(el) {
   };
 }
 
+function gameHeader(n) {
+  const c = n.card || {}, sc = n.scout;
+  const facts = [];
+  if (c.odds) facts.push(`<div><dt>Outlook</dt><dd><b>${esc(c.odds)}</b></dd></div>`);
+  if (c.us) facts.push(`<div><dt>Us / them</dt><dd>${esc(c.us)} / ${esc(c.them)}</dd></div>`);
+  if (c.oppRecord) facts.push(`<div><dt>Their record</dt><dd>${esc(c.oppRecord)}${c.oppRank ? ` · No. ${c.oppRank}` : ""}</dd></div>`);
+  if (c.venue) facts.push(`<div><dt>Venue</dt><dd>${esc(c.venue)}${c.noise ? ` · ${esc(c.noise)}` : ""}</dd></div>`);
+  if (c.kick) facts.push(`<div><dt>Kickoff</dt><dd>${esc(c.kick)}</dd></div>`);
+  if (c.forecast) facts.push(`<div><dt>Forecast</dt><dd>${esc(c.forecast)}</dd></div>`);
+  if (c.series) facts.push(`<div><dt>Series</dt><dd>${esc(c.series)}${c.lastMeeting ? ` · last: ${esc(c.lastMeeting)}` : ""}</dd></div>`);
+  if (c.rivalry || c.trophy) facts.push(`<div><dt>Rivalry</dt><dd>${esc([c.rivalry, c.trophy].filter(Boolean).join(" · "))}</dd></div>`);
+  return `<section class="panel"><h2>${esc(c.label || "Week " + n.week)}: ${n.site === "away" ? "at " : "vs "}<a href="#/team/${esc(n.oppId)}">${esc(n.opp)}</a></h2>
+      <dl class="kv">${facts.join("")}</dl>
+      ${n.film.length ? `<h3 style="margin-top:12px">From the film room</h3><ul>${n.film.map((x) => `<li>${esc(x)}</li>`).join("")}</ul>` : ""}
+      ${sc ? `<h3 style="margin-top:12px">${esc(n.opp)} tendencies (${esc(sc.team)} team)</h3>
+        <p><b>Offense</b> ${esc(sc.offense)}</p><p><b>Defense</b> ${esc(sc.defense)}</p>
+        <p class="note">Staff says: ${esc(sc.tips.join("; "))}.</p>
+        <h3 style="margin-top:12px">Their best players</h3>
+        <div class="table-wrap"><table><tbody>${sc.best.map((b) => `<tr><td class="tight">${esc(b.p)}</td><td><b>${esc(b.n)}</b> <span class="quiet">${esc(b.yr)}</span><br><span class="quiet small">${esc(b.film)}</span></td><td>${esc(b.looks)}</td></tr>`).join("")}</tbody></table></div>` : ""}
+    </section>`;
+}
+
 function myGameday(el) {
   const B = S.B, d = S.draft, G = B.gameday, R = S.rules;
   const openPlan = S.manifest.sections.includes("plan"), openDepth = S.manifest.sections.includes("depth"), openCalls = S.manifest.sections.includes("calls");
@@ -569,8 +652,7 @@ function myGameday(el) {
   const names = {};
   B.roster.forEach((p) => (names[p.id] = p));
   el.innerHTML = `
-    ${n ? `<section class="panel"><h2>Week ${n.week}: ${n.site === "away" ? "at " : n.site === "neutral" ? "vs " : "vs "}<a href="#/team/${esc(n.oppId)}">${esc(n.opp)}</a></h2>
-      ${n.film.length ? `<ul>${n.film.map((x) => `<li>${esc(x)}</li>`).join("")}</ul>` : ""}</section>` : `<div class="note">No game this week.</div>`}
+    ${n ? gameHeader(n) : `<div class="note">No game this week.</div>`}
     <div class="grid" style="margin-top:20px">
     <section><h2>Practice focus</h2><div class="choices">${[["staff", { label: "The staff's call", blurb: "weather prep when it's coming, balanced otherwise" }], ...Object.entries(R.focus)].map(([k, v]) => `<label class="choice ${d.plan.focus === k ? "on" : ""}"><input type="radio" name="focus" value="${k}" ${d.plan.focus === k ? "checked" : ""} ${openPlan ? "" : "disabled"}><span>${esc(v.label)}<small>${esc(v.blurb)}</small></span></label>`).join("")}</div></section>
     <section><h2>Game plan</h2>
@@ -616,26 +698,88 @@ function myGameday(el) {
   };
 }
 
+const MOOD_TAG = { "fired up": "good", happy: "good", content: "", restless: "warn", unhappy: "bad", "wants out": "bad" };
+
 function myRoster(el) {
-  const groups = {};
-  S.B.roster.forEach((p) => (groups[p.p] = groups[p.p] || []).push(p));
-  el.innerHTML = `<p class="muted">What your staff sees. There are no ratings here: you get their read, this week's practice and their notes.</p>
-    ${S.rules.positions.filter((pos) => groups[pos]).map((pos) => `<section><h2>${pos}</h2><div class="players">${groups[pos].map((p) => `<div class="player">
-      <div class="who"><b>${esc(p.n)}</b> <span class="quiet">#${p.num}</span><span class="quiet">${esc(p.yr)}, ${esc(p.ht)} ${p.wt}, ${esc(p.home)}${p.stars ? `, ${p.stars}★ recruit` : ""}</span>
-        <span class="eval">${esc(p.eval)}</span> <span class="quiet">${esc(p.trend)}</span>${p.inj ? ` <span class="tag bad">${esc(p.inj)}</span>` : ""}</div>
-      <div><div class="practice">${esc(p.practice)}</div><p style="margin:4px 0">${esc(p.comments)}</p>
-        <div class="traits">${p.traits.length ? esc(p.traits.join(", ")) + " · " : ""}potential ${esc(p.potential)} · ${esc(p.mood)}${p.nil ? ` · NIL $${p.nil.toLocaleString()}` : ""}${p.stats ? ` · ${esc(p.stats)}` : ""}</div></div>
-    </div>`).join("")}</div></section>`).join("")}`;
+  const B = S.B, groups = {};
+  B.roster.forEach((p) => (groups[p.p] = groups[p.p] || []).push(p));
+  const P = B.practice || { battles: [], ideas: [] };
+  el.innerHTML = `<p class="muted">What your staff sees. No ratings: their read on each player, this week's practice and their notes. Open a name for his full card.</p>
+    <div class="grid" style="margin-top:12px">
+      <section><h2>Position battles</h2>${P.battles.length ? `<ul>${P.battles.map(([pos, t]) => `<li><b>${esc(pos)}</b> ${esc(t)}</li>`).join("")}</ul>` : `<p class="muted">No real battles this week. The depth chart is settled.</p>`}</section>
+      <section><h2>Staff depth ideas</h2>${P.ideas.length ? `<ul>${P.ideas.map((t) => `<li>${esc(t)}</li>`).join("")}</ul>` : `<p class="muted">The staff likes the depth chart as it is.</p>`}</section>
+    </div>
+    ${S.rules.positions.filter((pos) => groups[pos]).map((pos) => `<section><h2>${pos}</h2><div class="table-wrap"><table>
+      <thead><tr><th class="tight">#</th><th>Name</th><th>Class</th><th>Looks like</th><th>Dev</th><th>Practice</th><th>Best at</th><th>Mood</th><th class="r">NIL</th></tr></thead><tbody>
+      ${groups[pos].map((p) => `<tr class="${p.starter ? "starter-row" : ""}"><td class="num">${p.num}</td>
+        <td><a href="#/my/player/${p.id}">${esc(p.n)}</a>${p.inj ? ` <span class="tag bad">${esc(p.inj)}</span>` : ""}${p.portal[0] ? ` <span class="tag warn">${esc(p.portal[0])}</span>` : ""}</td>
+        <td>${esc(p.yr)}</td><td><b>${esc(p.eval)}</b> <span class="quiet">${esc(p.trend)}</span></td><td class="num">${esc(p.dev)}</td>
+        <td class="quiet small">${esc(p.practice)}${p.week ? ` <span class="tag ${p.week === "good week" ? "good" : "bad"}">${esc(p.week)}</span>` : ""}</td>
+        <td class="quiet">${esc(p.best.join(", "))}</td><td><span class="tag ${MOOD_TAG[p.mood] || ""}">${esc(p.mood)}</span></td>
+        <td class="r num">${p.nil ? money(p.nil) : ""}</td></tr>`).join("")}</tbody></table></div></section>`).join("")}`;
+}
+
+function statTables(rows) {
+  return rows.map(([g, cells]) => `<div class="statgrp"><h4>${esc(g)}</h4><dl>${cells.map(([k, v]) => `<div><dt>${esc(k)}</dt><dd>${esc(v)}</dd></div>`).join("")}</dl></div>`).join("");
+}
+
+async function viewMyPlayer(id) {
+  if (!S.B) { location.hash = "#/login"; return; }
+  const p = S.B.roster.find((x) => x.id === Number(id));
+  if (!p) { app().innerHTML = `<p class="empty">He isn't on your roster.</p>`; return; }
+  const st = p.staff || {};
+  const kv = (k, v) => (v || v === 0 ? `<div><dt>${esc(k)}</dt><dd>${v}</dd></div>` : "");
+  app().innerHTML = `<p><a href="#/my/roster">Roster</a></p>
+    <h1>#${p.num} ${esc(p.n)}</h1>
+    <p class="muted">${esc(p.p)} · ${esc(p.yr)} · ${esc(p.ht)}, ${p.wt} lbs · ${esc(p.homeName || p.home)}${p.stars ? ` · ${stars(p.stars)} recruit` : ""}${p.transfer ? ` · transfer from ${esc(p.transfer)}` : ""}</p>
+    ${p.gen ? `<div class="note good">Generational talent: the kind of prospect who comes along every few years.</div>` : ""}
+    ${p.inj ? `<div class="note bad">${esc(p.inj)}</div>` : ""}
+    <dl class="kv">
+      ${kv("Looks like", `<b>${esc(p.eval)}</b>`)}${kv("Development", `<b>${esc(p.dev)}</b>`)}${kv("Ceiling", esc(p.potential))}
+      ${kv("Durability", esc(p.durability.toLowerCase()))}${kv("Offseasons developed", p.developed)}${kv("Trend", esc(p.trend))}
+      ${kv("Morale", `<b>${p.morale}</b> ${esc(p.mood)}`)}${kv("Classroom", esc(p.school))}${kv("NIL deal", p.nil ? money(p.nil) + " a year" : "none")}
+      ${kv("Depth", `${p.depth} at ${esc(p.p)}${p.starter ? " (starter)" : ""}`)}${p.portal[0] ? kv("Transfer watch", `${esc(p.portal[0])}${p.portal[1] ? ` <span class="quiet">(${esc(p.portal[1])})</span>` : ""}`) : ""}
+    </dl>
+    ${p.lately.length ? `<p class="quiet">Lately: ${esc(p.lately.join("; "))}</p>` : ""}
+    <div class="grid" style="margin-top:18px">
+      <section class="panel"><h2>This week</h2>
+        <p>${esc(p.practice || "No practice report yet.")}${p.week ? ` <span class="tag ${p.week === "good week" ? "good" : "bad"}">${esc(p.week)}</span>` : ""}</p>
+        <p><b>Staff report:</b> ${esc(p.comments)}</p></section>
+      <section class="panel"><h2>Depth room</h2>
+        <dl class="kv">${kv("Staff board", st.board ? `${st.board}` : "")}${kv("Coordinator", st.coord ? `${st.coord}` : "")}${kv("Position coach", st.pos ? `${st.pos}` : "")}</dl>
+        ${st.split ? `<p><span class="tag warn">Staff split</span></p>` : ""}
+        ${st.coordNote ? `<p><b>Coordinator:</b> ${esc(st.coordNote)}</p>` : ""}${st.posNote ? `<p><b>Position coach:</b> ${esc(st.posNote)}</p>` : ""}
+        <p class="quiet">${st.film && st.film.length ? `Film grades ${st.film.join(", ")} · ${esc(st.filmWord)}` : "No game film yet."}${st.camp && st.camp.length ? ` · Camp ${st.camp.map((v) => (v > 0 ? "+" : "") + v).join(", ")} (${esc(st.campWord)})` : ""}</p></section>
+    </div>
+    ${p.explain.length ? `<section style="margin-top:22px"><h2>Personality</h2><dl class="kv wide">${p.explain.map(([k, v]) => `<div><dt>${esc(k)}</dt><dd>${esc(v)}</dd></div>`).join("")}</dl></section>` : ""}
+    <section style="margin-top:22px"><h2>${p.gp ? `${S.manifest.year} season · ${p.gp} game${p.gp === 1 ? "" : "s"}` : p.cgp ? `Career · ${p.cgp} games` : "Stats"}</h2>
+      ${(p.season.length ? statTables(p.season) : p.career.length ? statTables(p.career) : `<p class="muted">No statistics recorded.</p>`)}
+      ${p.gp && p.career.length ? `<h3 style="margin-top:12px">Career</h3>${statTables(p.career)}` : ""}</section>
+    <div class="grid" style="margin-top:22px">
+      <section><h2>${esc(p.p)} skills</h2><table><tbody>${p.skills.map(([k, v]) => `<tr><td>${esc(k)}</td><td><b>${esc(v)}</b></td></tr>`).join("")}</tbody></table></section>
+      <section><h2>Athlete</h2><table><tbody>${p.athlete.map(([k, v]) => `<tr><td>${esc(k)}</td><td><b>${esc(v)}</b></td></tr>`).join("")}</tbody></table>
+        <h3 style="margin-top:14px">Other positions</h3><table><tbody>${p.alt.map(([k, v]) => `<tr><td>${esc(k)}</td><td>${esc(v)}</td></tr>`).join("")}</tbody></table></section>
+    </div>
+    ${p.timeline.length ? `<section style="margin-top:22px"><h2>Career timeline</h2>${p.timeline.map((y) => `<div class="tl"><b>${y.y}</b>${y.looked ? ` <span class="quiet">looked like: ${esc(y.looked)}</span>` : ""}
+      ${y.events.length ? `<ul>${y.events.map((e) => `<li>${esc(e)}</li>`).join("")}</ul>` : ""}${y.stats ? `<p class="quiet">${esc(y.stats)}${y.gp ? ` (${y.gp} games)` : ""}</p>` : ""}</div>`).join("")}</section>` : ""}`;
 }
 
 function myCoach(el) {
-  const c = S.B.coach || {}, card = S.B.card || {};
+  const c = S.B.coach || {}, card = S.B.card || {}, pg = S.B.program || {}, R = S.B.reports || {};
+  const rep = (title, key) => (R[key] ? `<section style="margin-top:22px"><h2>${title}</h2><pre class="screen">${esc(R[key])}</pre></section>` : "");
   el.innerHTML = `<div class="grid">
     <section class="panel"><h2>${esc(c.name || "Head coach")}</h2>
-      <p>Hot seat: <b>${esc(c.seatLabel || "")}</b>${c.seatMove ? ` (${c.seatMove > 0 ? "up" : "down"} ${Math.abs(c.seatMove)} this week)` : ""}</p>
+      <p>Hot seat: <b>${esc(c.seatLabel || "")}</b> <span class="quiet">(${c.seat ?? ""}/100${c.seatMove ? `, ${c.seatMove > 0 ? "up" : "down"} ${Math.abs(c.seatMove)} this week` : ""})</span></p>
       ${c.contract ? `<p>Contract: ${esc(c.contract)}</p>` : ""}${c.ad ? `<p>Athletic director: ${esc(c.ad)}</p>` : ""}
       <p class="muted">${esc(card.record || "")} this season${card.confRecord ? `, ${esc(card.confRecord)} in conference` : ""}</p></section>
-    <section><h2>Your AD's goals</h2>${(c.goals || []).length ? `<div class="table-wrap"><table><tbody>${c.goals.map((g) => `<tr><td>${esc(g.text)}</td><td><span class="tag ${g.status === "met" ? "good" : g.status === "failed" ? "bad" : ""}">${esc(g.status)}</span></td><td class="quiet">${esc(g.note)}</td></tr>`).join("")}</tbody></table></div>` : `<p class="muted">No written goals. The mood is the bar.</p>`}</section></div>`;
+    <section><h2>Your AD's goals</h2>${(c.goals || []).length ? `<div class="table-wrap"><table><tbody>${c.goals.map((g) => `<tr><td>${esc(g.text)}</td><td><span class="tag ${g.status === "met" ? "good" : g.status === "failed" ? "bad" : ""}">${esc(g.status)}</span></td><td class="quiet">${esc(g.note)}</td></tr>`).join("")}</tbody></table></div>` : `<p class="muted">No written goals. The mood is the bar.</p>`}</section>
+    <section class="panel"><h2>Program</h2><dl class="kv">
+      <div><dt>Prestige</dt><dd>${pg.prestige ?? ""}</dd></div><div><dt>Budget</dt><dd>${esc(pg.budget || "")}</dd></div>
+      <div><dt>NIL free</dt><dd>${esc(pg.nil || "")}</dd></div><div><dt>Stadium</dt><dd>${(pg.capacity || 0).toLocaleString()} · ${esc(pg.noise || "")}</dd></div>
+      ${(pg.facilities || []).map((f) => `<div><dt>${esc(f.k)} facilities</dt><dd>${f.v} of 10</dd></div>`).join("")}
+      ${pg.project ? `<div><dt>Stadium project</dt><dd>${esc(pg.project)}</dd></div>` : ""}</dl></section>
+    </div>
+    ${rep("Program", "program")}${rep("Staff room", "staff")}${rep("Budget", "budget")}${rep("Facilities", "facilities")}${rep("Locker room", "locker")}${rep("Transfer watch", "portal")}`;
 }
 
 function buildOrders() {
