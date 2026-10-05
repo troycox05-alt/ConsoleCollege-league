@@ -101,10 +101,19 @@ function freshDraft(B) {
     plan: G.plan ? { ...G.plan, script: !!G.plan.script } : { focus: "balanced", off: "film", def: "film", script: false },
     calls: { off: G.calls.off, def: G.calls.def },
     locks: JSON.parse(JSON.stringify(G.locks || {})),
+    jobs: { want: [...((B.jobs || {}).want || [])], extend: (B.jobs || {}).extend || "ask" },
+    staff: { fire: [], lists: JSON.parse(JSON.stringify((B.staff || {}).lists || {})) },
+    money: { facility: "", restructure: [], coordcut: [], poscut: [], stretch: false },
+    nilAns: {}, draftAns: {}, keep: {}, poffer: {}, moves: {}, cuts: [],
+    spring: { emphasis: ((B.spring || {}).emphasis) || "fundamentals", focus: [] },
   };
 }
 function saveDraft() { if (S.B && S.draft) store.set(draftKey(S.B), S.draft); }
-function loadDraft(B) { return store.get(draftKey(B)) || freshDraft(B); }
+function loadDraft(B) {
+  const d = store.get(draftKey(B)) || freshDraft(B), f = freshDraft(B);
+  ["jobs", "staff", "money", "nilAns", "draftAns", "keep", "poffer", "moves", "cuts", "spring"].forEach((k) => { if (!d[k]) d[k] = f[k]; });
+  return d;
+}
 
 async function login(id, password) {
   const B = await unlockTeam(id, password);
@@ -185,7 +194,7 @@ function renderWho() {
 function renderStrip() {
   const m = S.manifest;
   const due = [];
-  const names = { rec: "recruiting", depth: "depth chart", plan: "game plan", calls: "play-calling" };
+  const names = { rec: "recruiting", depth: "depth chart", plan: "game plan", calls: "play-calling", jobs: "jobs", staff: "staff", money: "money", nil: "NIL raises and the draft", portal: "the portal", roster: "roster week", spring: "spring" };
   m.sections.forEach((s) => due.push(names[s] || s));
   $("#strip").innerHTML = `<div class="strip-inner"><span class="cycle">Cycle ${m.cycle}</span>
     <span>${esc(m.label)}</span>
@@ -221,13 +230,13 @@ function showMeter(on) {
 const routes = [
   [/^$/, viewHome], [/^scores(?:\/(\d+))?$/, viewScores], [/^standings$/, viewStandings], [/^polls$/, viewPolls],
   [/^recruits$/, viewRecruits], [/^recruit\/(\d+)$/, viewRecruit], [/^teams$/, viewTeams], [/^team\/([\w-]+)$/, viewTeam],
-  [/^directory$/, viewDirectory], [/^login$/, viewLogin], [/^my\/player\/(\d+)$/, viewMyPlayer], [/^my(?:\/(\w+))?$/, viewMy],
+  [/^game\/(\d+)\/(\d+)$/, viewGame], [/^player\/([\w-]+)\/(\d+)$/, viewPlayer], [/^directory$/, viewDirectory], [/^jobs$/, viewJobs], [/^guide$/, viewGuide], [/^login$/, viewLogin], [/^my\/player\/(\d+)$/, viewMyPlayer], [/^my(?:\/(\w+))?$/, viewMy],
 ];
 
 async function route() {
   const h = decodeURIComponent(location.hash.replace(/^#\/?/, ""));
   const [path, query] = h.split("?");
-  setNav(path);
+  setNav(path.startsWith("game/") ? "scores" : path.startsWith("player/") ? "teams" : path);
   showMeter(false);
   for (const [re, fn] of routes) {
     const m = path.match(re);
@@ -249,7 +258,7 @@ function gameCard(g) {
   return `<div class="game">
     <div class="row ${played && awayWon ? "won" : ""}"><span>${rk(g.ar)}${teamLink(g.away)}</span><span class="sc">${played ? g.a : ""}</span></div>
     <div class="row ${played && !awayWon ? "won" : ""}"><span>${g.neutral ? "" : "@ "}${rk(g.hr)}${teamLink(g.home)}</span><span class="sc">${played ? g.h : ""}</span></div>
-    ${g.name ? `<div class="meta">${esc(g.name)}</div>` : played ? "" : `<div class="meta">Upcoming</div>`}</div>`;
+    ${g.name || g.box || !played ? `<div class="meta">${g.name ? esc(g.name) : played ? "" : "Upcoming"}${g.box ? `${g.name ? " · " : ""}<a href="#/game/${g.w}/${g.gi}">Box score</a>` : ""}</div>` : ""}</div>`;
 }
 function rankedFirst(games) {
   return [...games].sort((a, b) => Math.min(a.hr || 99, a.ar || 99) - Math.min(b.hr || 99, b.ar || 99));
@@ -508,12 +517,76 @@ async function viewTeam(id) {
     <p class="muted">${esc(meta.confName)} · ${esc(c.record || meta.record)} (${esc(c.confRecord || meta.confRecord)} conference)${c.rank ? ` · ranked ${c.rank}` : ""} · head coach ${esc(T.coach.name)}${T.coach.record ? ` (${esc(T.coach.record)})` : ""} · ${meta.owner ? "@" + esc(meta.owner) : "CPU program"}</p>
     ${c.looks && c.looks.team ? `<p>Around the league they look <b>${esc(c.looks.team)}</b>: offense ${esc(c.looks.offense || "")}, defense ${esc(c.looks.defense || "")}.</p>` : ""}
     <div class="grid" style="margin-top:18px">
-      <section><h2>Schedule</h2><div class="table-wrap"><table><tbody>${(T.schedule || []).map((g) => `<tr><td class="quiet tight">${esc(g.wk)}</td><td>${g.site === "at" ? "at " : ""}${rk(g.oppRank)}${esc(g.opp)}</td><td class="r num">${g.played ? `${g.won ? "W" : "L"} ${esc(g.score)}` : ""}</td></tr>`).join("")}</tbody></table></div></section>
+      <section><h2>Schedule</h2><div class="table-wrap"><table><tbody>${(T.schedule || []).map((g) => `<tr><td class="quiet tight">${esc(g.wk)}</td><td>${g.site === "at" ? "at " : ""}${rk(g.oppRank)}${esc(g.opp)}</td><td class="r num">${g.played ? (g.box ? `<a href="#/game/${g.w}/${g.gi}">${g.won ? "W" : "L"} ${esc(g.score)}</a>` : `${g.won ? "W" : "L"} ${esc(g.score)}`) : ""}</td></tr>`).join("")}</tbody></table></div></section>
       <section><h2>Committed</h2>${T.commits.length ? `<ul>${T.commits.map((rid) => { const r = S.recById[rid]; return r ? `<li><a href="#/recruit/${rid}">${esc(r.n)}</a> ${r.p} ${stars(r.s)}</li>` : ""; }).join("")}</ul>` : `<p class="muted">No public commitments yet.</p>`}</section>
-      <section class="wide"><h2>Roster</h2><p class="quiet">From the outside you see a rough tier for each player, his traits and his stats. Only his own staff sees more.</p>
+      <section class="wide"><h2>Roster</h2><p class="quiet">From the outside you see a rough tier for each player, his traits and his stats. Click a name for his stats and game log. Only his own staff sees more.</p>
         <div class="table-wrap"><table><thead><tr><th class="tight">#</th><th>Name</th><th>Pos</th><th>Class</th><th>Size</th><th>Tier (approx.)</th><th>Traits</th><th>Season</th></tr></thead><tbody>
-        ${Object.values(groups).flat().map((p) => `<tr><td class="num">${p.num}</td><td>${esc(p.n)}${p.inj ? ` <span class="tag bad">${esc(p.inj)}</span>` : ""}</td><td>${p.p}</td><td>${esc(p.yr)}</td><td class="quiet">${esc(p.ht)} ${p.wt}</td><td>${esc(p.tier)}</td><td class="traits">${p.traits.map(esc).join(", ")}</td><td class="quiet">${esc(p.stats)}</td></tr>`).join("")}
+        ${Object.values(groups).flat().map((p) => `<tr><td class="num">${p.num}</td><td><a href="#/player/${esc(id)}/${p.id}">${esc(p.n)}</a>${p.inj ? ` <span class="tag bad">${esc(p.inj)}</span>` : ""}</td><td>${p.p}</td><td>${esc(p.yr)}</td><td class="quiet">${esc(p.ht)} ${p.wt}</td><td>${esc(p.tier)}</td><td class="traits">${p.traits.map(esc).join(", ")}</td><td class="quiet">${esc(p.stats)}</td></tr>`).join("")}
         </tbody></table></div></section></div>`;
+}
+
+// ── box score ──
+const pLink = (tid, pid, name) => `<a href="#/player/${esc(tid)}/${pid}">${esc(name)}</a>`;
+
+async function viewGame(w, i) {
+  const games = await getJSON(`games/w${w}.json`).catch(() => null);
+  const G = games && games[Number(i)];
+  if (!G) { app().innerHTML = `<p class="empty">No box score for that game. <a href="#/scores/${esc(w)}">Back to the scores</a>.</p>`; return; }
+  const [A, H] = G.teams;
+  const nq = Math.max(A.line.length, H.line.length, 4);
+  const qh = Array.from({ length: nq }, (_, k) => (k < 4 ? `${k + 1}` : nq === 5 ? "OT" : `OT${k - 3}`));
+  const won = (t, o) => (t.score > o.score ? "won" : "");
+  const short = (t) => esc(team(t.id).school || t.school);
+  const lineRow = (t, o) => `<tr class="${won(t, o)}"><td>${rk(t.rank)}${teamLink(t.id)}</td>${qh.map((_, k) => `<td class="r num">${t.line[k] ?? ""}</td>`).join("")}<td class="r num"><b>${t.score}</b></td></tr>`;
+  const catTable = (c, k) => {
+    const rows = c.rows[k];
+    if (!rows.length) return "";
+    return `<div class="table-wrap"><table class="box"><thead><tr><th>${esc(c.name)}</th>${c.cols.map((h) => `<th class="r">${esc(h)}</th>`).join("")}</tr></thead><tbody>
+      ${rows.map(([pid, n, pos, ...v]) => `<tr><td>${pLink(G.teams[k].id, pid, n)} <span class="quiet">${esc(pos)}</span></td>${v.map((x) => `<td class="r num">${esc(x)}</td>`).join("")}</tr>`).join("")}</tbody></table></div>`;
+  };
+  const side = (k) => `<section><h2>${short(G.teams[k])}</h2>${G.cats.map((c) => catTable(c, k)).join("") || `<p class="muted">No individual stats recorded.</p>`}</section>`;
+  const byQ = {};
+  G.scoring.forEach((s) => (byQ[s[0]] = byQ[s[0]] || []).push(s));
+  app().innerHTML = `<p><a href="#/scores/${G.w}">${esc(G.label)} scores</a></p>
+    <h1 class="boxhead"><span class="${won(A, H)}">${short(A)} ${A.score}</span><span class="quiet">${G.neutral ? "vs" : "at"}</span><span class="${won(H, A)}">${short(H)} ${H.score}</span></h1>
+    <p class="muted">${esc(G.label)}${G.name ? ` · ${esc(G.name)}` : ""}${G.neutral ? " · neutral site" : ""}${G.att ? ` · attendance ${Number(G.att).toLocaleString()}` : ""}</p>
+    <div class="table-wrap" style="margin-top:14px"><table class="box"><thead><tr><th></th>${qh.map((q) => `<th class="r">${q}</th>`).join("")}<th class="r">T</th></tr></thead>
+      <tbody>${lineRow(A, H)}${lineRow(H, A)}</tbody></table></div>
+    <div class="grid" style="margin-top:18px">
+      <section><h2>Scoring</h2>${G.scoring.length ? Object.entries(byQ).map(([q, list]) => `<h4 class="qhead">${Number(q) <= 4 ? ["", "First", "Second", "Third", "Fourth"][q] + " quarter" : "Overtime"}</h4>
+        <div class="table-wrap"><table class="box"><tbody>${list.map(([, clock, tid, text, a, h]) => `<tr><td class="quiet tight num">${esc(clock)}</td><td class="tight">${esc(team(tid).abbr || team(tid).school)}</td><td>${esc(text)}</td>${a === null ? "" : `<td class="r num tight">${a}-${h}</td>`}</tr>`).join("")}</tbody></table></div>`).join("") : `<p class="muted">No scoring.</p>`}</section>
+      <section><h2>Team stats</h2><div class="table-wrap"><table class="box"><thead><tr><th></th><th class="r">${short(A)}</th><th class="r">${short(H)}</th></tr></thead><tbody>
+        ${G.team.map(([k, a, h]) => `<tr><td>${esc(k)}</td><td class="r num">${esc(a)}</td><td class="r num">${esc(h)}</td></tr>`).join("")}</tbody></table></div></section>
+    </div>
+    <div class="grid" style="margin-top:18px">${side(0)}${side(1)}</div>
+    ${G.drives.length ? `<details style="margin-top:22px"><summary><b>Drive chart</b> <span class="quiet">(${G.drives.length} drives)</span></summary>
+      <div class="table-wrap"><table class="box"><thead><tr><th>Team</th><th class="r">Q</th><th class="r">Start</th><th class="r">Own</th><th class="r">Plays</th><th class="r">Yds</th><th class="r">Time</th><th>Result</th></tr></thead><tbody>
+      ${G.drives.map(([tid, q, clock, start, plays, yds, time, res]) => `<tr><td>${esc(team(tid).school)}</td><td class="r num">${q}</td><td class="r num">${esc(clock)}</td><td class="r num">${start ?? ""}</td><td class="r num">${plays ?? ""}</td><td class="r num">${yds ?? ""}</td><td class="r num">${esc(time)}</td><td>${esc(res)}</td></tr>`).join("")}</tbody></table></div></details>` : ""}`;
+}
+
+// ── any player, from the outside ──
+function gameLog(log) {
+  if (!log || !log.length) return `<p class="muted">No games played this season.</p>`;
+  return `<div class="table-wrap"><table><thead><tr><th class="tight">Week</th><th>Opponent</th><th class="tight">Result</th><th>Line</th></tr></thead><tbody>
+    ${log.map(([w, label, gi, opp, site, res, line]) => `<tr><td class="quiet tight">${esc(label)}</td><td>${site === "at" ? "at " : ""}${teamLink(opp)}</td><td class="num tight"><a href="#/game/${w}/${gi}">${esc(res)}</a></td><td>${esc(line) || `<span class="quiet">played</span>`}</td></tr>`).join("")}</tbody></table></div>`;
+}
+
+async function viewPlayer(tid, pid) {
+  const T = await getJSON(`teams/${tid}.json`).catch(() => null);
+  const p = T && T.roster.find((x) => x.id === Number(pid));
+  if (!p) { app().innerHTML = `<p class="empty">He isn't on a roster anymore. <a href="#/team/${esc(tid)}">Back to ${esc(team(tid).school || "the team")}</a>.</p>`; return; }
+  const mine = S.B && S.B.id === tid;
+  app().innerHTML = `<p><a href="#/team/${esc(tid)}">${esc(team(tid).school)} roster</a></p>
+    <h1>#${p.num} ${esc(p.n)}</h1>
+    <p class="muted">${esc(p.p)} · ${esc(p.yr)} · ${esc(p.ht)}, ${p.wt} lbs${p.home ? ` · ${esc(p.home)}` : ""}${p.stars ? ` · ${stars(p.stars)} recruit` : ""} · ${p.depth === 1 ? "starter" : `No. ${p.depth}`} at ${esc(p.p)}</p>
+    ${mine ? `<div class="note good">He's yours. <a href="#/my/player/${p.id}">Open your staff's full card</a> for evaluations, practice and comments.</div>` : ""}
+    ${p.inj ? `<div class="note bad">${esc(p.inj)}</div>` : ""}
+    <dl class="kv"><div><dt>Tier (approx.)</dt><dd><b>${esc(p.tier)}</b></dd></div><div><dt>Traits</dt><dd>${p.traits.length ? p.traits.map(esc).join(", ") : "none known"}</dd></div>
+      <div><dt>Games</dt><dd>${p.gp} this season, ${p.cgp} career</dd></div></dl>
+    <section style="margin-top:22px"><h2>${S.manifest.year} season</h2>${p.season.length ? statTables(p.season) : `<p class="muted">No statistics recorded this season.</p>`}</section>
+    <section style="margin-top:22px"><h2>Game log</h2>${gameLog(p.log)}</section>
+    ${p.career.length ? `<section style="margin-top:22px"><h2>Career · ${p.cgp} games</h2>${statTables(p.career)}
+      ${p.years.length ? `<div class="table-wrap" style="margin-top:12px"><table><tbody>${p.years.map(([y, l]) => `<tr><td class="tight num">${y}</td><td>${esc(l)}</td></tr>`).join("")}</tbody></table></div>` : ""}</section>` : ""}`;
 }
 
 async function viewDirectory() {
@@ -538,7 +611,7 @@ async function viewLogin() {
   $("#lf").onsubmit = async (ev) => {
     ev.preventDefault();
     $("#lb").disabled = true; $("#lb").textContent = "Unlocking…"; $("#le").hidden = true;
-    try { await login($("#lt").value, $("#lp").value); location.hash = "#/my/recruiting"; }
+    try { await login($("#lt").value, $("#lp").value); location.hash = "#/my"; }
     catch (e) { $("#le").hidden = false; $("#le").textContent = e.message; $("#lb").disabled = false; $("#lb").textContent = "Log in"; }
   };
 }
@@ -548,10 +621,17 @@ async function viewLogin() {
 async function viewMy(tab) {
   if (!S.B) { location.hash = "#/login"; return; }
   await loadRecruits();
-  tab = tab || "recruiting";
-  const tabs = [["recruiting", "Recruiting"], ["gameday", "Game day"], ["roster", "Roster"], ["coach", "Program"], ["code", "Code"]];
+  const live = S.manifest.sections;
+  tab = tab || (live.includes("portal") ? "portal" : live.includes("roster") ? "rosterweek" : live.includes("spring") ? "spring"
+    : live.includes("rec") ? "recruiting" : live.includes("nil") ? "season" : "jobs");
+  const tabs = [["recruiting", "Recruiting"], ["gameday", "Game day"], ["roster", "Roster"], ["coach", "Program"], ["staff", "Staff"], ["money", "Money"],
+    ...(S.manifest.sections.includes("nil") ? [["season", "Season end"]] : []),
+    ...(S.manifest.sections.includes("portal") || (S.B.portal && S.B.portal.mine) ? [["portal", "Portal"]] : []),
+    ...(S.manifest.sections.includes("roster") ? [["rosterweek", "Roster week"]] : []),
+    ...(S.manifest.sections.includes("spring") || S.B.spring ? [["spring", "Spring"]] : []),
+    ["jobs", "Jobs"], ["code", "Code"]];
   const head = `<h1>${esc(S.B.team)}</h1><nav class="subnav" aria-label="My team">${tabs.map(([k, v]) => `<a href="#/my/${k}" class="${k === tab ? "on" : ""}">${v}</a>`).join("")}</nav>`;
-  const fn = { recruiting: myRecruiting, gameday: myGameday, roster: myRoster, coach: myCoach, code: myCode }[tab] || myRecruiting;
+  const fn = { recruiting: myRecruiting, gameday: myGameday, roster: myRoster, coach: myCoach, staff: myStaff, money: myMoney, season: mySeason, jobs: myJobs, portal: myPortal, rosterweek: myRosterWeek, spring: mySpring, code: myCode }[tab] || myRecruiting;
   app().innerHTML = head + `<div id="mybody"></div>`;
   fn($("#mybody"));
   showMeter(tab !== "code");
@@ -755,6 +835,7 @@ async function viewMyPlayer(id) {
     <section style="margin-top:22px"><h2>${p.gp ? `${S.manifest.year} season · ${p.gp} game${p.gp === 1 ? "" : "s"}` : p.cgp ? `Career · ${p.cgp} games` : "Stats"}</h2>
       ${(p.season.length ? statTables(p.season) : p.career.length ? statTables(p.career) : `<p class="muted">No statistics recorded.</p>`)}
       ${p.gp && p.career.length ? `<h3 style="margin-top:12px">Career</h3>${statTables(p.career)}` : ""}</section>
+    <section style="margin-top:22px"><h2>Game log</h2><div id="mylog"><p class="quiet">Loading…</p></div></section>
     <div class="grid" style="margin-top:22px">
       <section><h2>${esc(p.p)} skills</h2><table><tbody>${p.skills.map(([k, v]) => `<tr><td>${esc(k)}</td><td><b>${esc(v)}</b></td></tr>`).join("")}</tbody></table></section>
       <section><h2>Athlete</h2><table><tbody>${p.athlete.map(([k, v]) => `<tr><td>${esc(k)}</td><td><b>${esc(v)}</b></td></tr>`).join("")}</tbody></table>
@@ -762,6 +843,11 @@ async function viewMyPlayer(id) {
     </div>
     ${p.timeline.length ? `<section style="margin-top:22px"><h2>Career timeline</h2>${p.timeline.map((y) => `<div class="tl"><b>${y.y}</b>${y.looked ? ` <span class="quiet">looked like: ${esc(y.looked)}</span>` : ""}
       ${y.events.length ? `<ul>${y.events.map((e) => `<li>${esc(e)}</li>`).join("")}</ul>` : ""}${y.stats ? `<p class="quiet">${esc(y.stats)}${y.gp ? ` (${y.gp} games)` : ""}</p>` : ""}</div>`).join("")}</section>` : ""}`;
+  getJSON(`teams/${S.B.id}.json`).then((T) => {
+    const pub = T.roster.find((x) => x.id === p.id);
+    const el = $("#mylog");
+    if (el) el.innerHTML = gameLog(pub && pub.log) + `<p class="quiet"><a href="#/player/${esc(S.B.id)}/${p.id}">What everyone else sees</a></p>`;
+  }).catch(() => { const el = $("#mylog"); if (el) el.innerHTML = `<p class="muted">Game log unavailable.</p>`; });
 }
 
 function myCoach(el) {
@@ -780,6 +866,230 @@ function myCoach(el) {
       ${pg.project ? `<div><dt>Stadium project</dt><dd>${esc(pg.project)}</dd></div>` : ""}</dl></section>
     </div>
     ${rep("Program", "program")}${rep("Staff room", "staff")}${rep("Budget", "budget")}${rep("Facilities", "facilities")}${rep("Locker room", "locker")}${rep("Transfer watch", "portal")}`;
+}
+
+function viewGuide() {
+  const R = S.rules, M = S.manifest;
+  const off = (R.offseason || []).map((x, i) => `<li><b>${esc(x.label)}</b>${x.sections.length ? ` <span class="quiet">(you can send: ${esc(x.sections.join(", "))})</span>` : ""}</li>`).join("");
+  app().innerHTML = `<h1>How the league works</h1><p class="muted">${esc(M.title)} · game build ${esc(M.gameBuild || "")}</p>
+    <div class="grid" style="margin-top:16px">
+    <section><h2>Each cycle</h2><ol>
+      <li><b>Log in</b> with your program and the password the commissioner sent you. Your team's file opens in your browser; nothing is sent anywhere.</li>
+      <li><b>Make your decisions</b> on the My team tabs. The strip at the top says what's open this cycle. Your draft is kept in this browser until the next cycle.</li>
+      <li><b>Build your code</b> (My team → Code), copy it, and paste it in the submission form${M.formUrl ? ` (<a href="${esc(M.formUrl)}" target="_blank" rel="noopener">open it</a>)` : ""}. Only your newest code counts; build it again after any change.</li>
+      <li>The commissioner imports every code, runs the cycle and posts the new site. What your staff learned shows up then.</li>
+    </ol>
+    <p class="quiet">Miss a cycle and your standing orders keep running: your recruiting queue, depth chart, game plan and play-calling stay as you left them. Miss two in a row and your staff also works a basic recruiting board. Five in a row and the commissioner is asked whether to open your program to someone else.</p></section>
+    <section><h2>A season</h2><p>One cycle is one week: fall camp, Weeks 1-13, championship week, then the playoff and bowls. Then the offseason, in nine cycles:</p><ol>${off}</ol><p>Fall camp is next, and the new season begins.</p></section>
+    <section><h2>What the words mean</h2><p class="quiet">You never see a player's rating. Your staff tells you what he looks like, on a fixed scale (lowest to highest):</p>
+      <p><b>Players:</b> ${esc(R.scales.player.join(" · "))}</p>
+      <p><b>Skills:</b> ${esc(R.scales.skill.join(" · "))}</p>
+      <p><b>Athletic traits:</b> ${esc(R.scales.athlete.join(" · "))}</p>
+      <p><b>Other teams:</b> ${esc(R.scales.team.join(" · "))}</p>
+      <p class="quiet">Other programs' players show an approximate tier, re-read every four weeks. Recruit projections tighten as your staff evaluates him (scouted 0 to 3).</p></section>
+    <section><h2>Recruiting hours</h2><p>Each week your staff has a set number of hours. Standing orders run top to bottom and anything that doesn't fit is cut; the bar at the bottom of the screen shows how your week fits. Actions: ${Object.values(R.actions).map((a) => `${esc(a.label)} (${a.cost}h)`).join(", ")}.</p>
+      <p>Official visits cost ${R.ovCost}h (up to ${R.ovMax} per recruit, on a home game). Your board holds ${R.boardMax}.</p></section>
+    <section><h2>Your job</h2><p>Your AD judges you like any head coach: wins against expectations, his goals, recruiting. Your hot seat is on the Program tab. ADs can fire you mid-season. Fired, you keep your coach and can be hired again; rank up to three jobs on the Jobs tab and the offseason market may call.</p></section>
+    </div>`;
+}
+
+async function viewJobs() {
+  const rows = await getJSON("jobs.json").catch(() => []);
+  const sec = (kind) => rows.filter((r) => r.kind === kind);
+  const table = (list) => `<div class="table-wrap"><table><thead><tr><th>Program</th><th class="r">Prestige</th><th>Roster</th><th>Situation</th>${S.B ? "<th>You</th>" : ""}</tr></thead><tbody>
+    ${list.map((r) => `<tr><td>${teamLink(r.id)}${team(r.id).owner ? ` <span class="quiet">@${esc(team(r.id).owner)}</span>` : ""}</td><td class="r num">${r.prestige}</td><td>${esc(r.roster)}</td><td class="quiet">${esc(r.note)}</td>${S.B ? `<td>${esc(((S.B.jobs || {}).standing || {})[r.id] || "")}</td>` : ""}</tr>`).join("") || `<tr><td colspan="5" class="empty">None right now.</td></tr>`}</tbody></table></div>`;
+  app().innerHTML = `<h1>Jobs</h1><p class="muted">Open head coaching jobs, and the seats closest to opening. ${S.B ? "Your standing is where you'd land on that AD's list. Rank up to three on My team → Jobs." : "Log in to see where you'd stand."}</p>
+    <div class="grid" style="margin-top:18px"><section><h2>Open</h2>${table(sec("open"))}</section><section><h2>Could open</h2>${table(sec("could open"))}</section></div>`;
+}
+
+function myJobs(el) {
+  const B = S.B, d = S.draft, J = B.jobs || {}, st = J.standing || {}, open = S.manifest.sections.includes("jobs");
+  const ids = Object.keys(st);
+  const opt = (cur) => `<option value="">none</option>${ids.map((id) => `<option value="${esc(id)}" ${cur === id ? "selected" : ""}>${esc(team(id).school)} (${esc(st[id])})</option>`).join("")}`;
+  el.innerHTML = `<p class="muted">When the coaching market runs (in the offseason), any job you rank here can call you. The AD decides from where you'd stand on his list; if he offers, you've already said yes. A job you didn't rank goes to the commissioner to answer with you.</p>
+    <section class="panel" style="margin-top:12px"><h2>Jobs you want</h2>
+      <div class="controls">${[0, 1, 2].map((i) => `<label>${i + 1}. <select data-want="${i}" ${open ? "" : "disabled"}>${opt(d.jobs.want[i] || "")}</select></label>`).join("")}</div>
+      <p class="quiet">Only open jobs and seats that could open are listed. See them all on the <a href="#/jobs">Jobs page</a>.</p>
+      <h2 style="margin-top:16px">If your AD offers a new contract</h2>
+      <div class="choices">${[["ask", "Let the commissioner ask me"], ["yes", "Sign it"], ["no", "Turn it down"]].map(([k, v]) => `<label class="choice ${d.jobs.extend === k ? "on" : ""}"><input type="radio" name="ext" value="${k}" ${d.jobs.extend === k ? "checked" : ""} ${open ? "" : "disabled"}><span>${v}</span></label>`).join("")}</div>
+    </section>`;
+  el.onchange = (ev) => {
+    const t = ev.target;
+    if (t.dataset.want !== undefined) { d.jobs.want[Number(t.dataset.want)] = t.value; d.jobs.want = d.jobs.want.slice(0, 3); }
+    else if (t.name === "ext") d.jobs.extend = t.value;
+    else return;
+    saveDraft(); rerender(myJobs);
+  };
+}
+
+const CHAIRS = ["OC", "DC", "QB", "RB", "WR", "TE", "OL", "DL", "LB", "DB"];
+const CHAIR_NAME = { OC: "Offensive coordinator", DC: "Defensive coordinator", QB: "Quarterbacks", RB: "Running backs", WR: "Wide receivers", TE: "Tight ends", OL: "Offensive line", DL: "Defensive line", LB: "Linebackers", DB: "Defensive backs" };
+
+function myStaff(el) {
+  const B = S.B, d = S.draft, ST = B.staff || {}, open = S.manifest.sections.includes("staff"), off = S.manifest.sections.includes("nil");
+  const chair = d._chair || "OC";
+  const isCoord = chair === "OC" || chair === "DC";
+  const L = d.staff.lists[chair] = d.staff.lists[chair] || (isCoord ? { names: [], max: { salary: Math.round(ST.std.coord * 1.2), years: 3, calls: 0, title: 0, out: 0 } } : { names: [], premium: 0 });
+  const market = (ST.markets || {})[chair] || [];
+  el.innerHTML = `<p class="muted">Your staff, and the lists your AD works from if a chair opens this winter (a coach leaves, retires, or you let him go). He calls your names in order with your best package; if nobody says yes, he makes the hire.</p>
+    <div class="table-wrap" style="margin-top:12px"><table><thead><tr><th>Chair</th><th>Coach</th><th class="r">Age</th><th class="r">OVR</th><th>Notes</th><th class="r">Pay</th>${off ? "<th>Let go</th>" : ""}</tr></thead><tbody>
+    ${(ST.now || []).map((c) => `<tr><td>${esc(CHAIR_NAME[c.key])}</td><td>${c.name ? esc(c.name) : `<span class="tag bad">open</span>`}</td><td class="r num">${c.age ?? ""}</td><td class="r num">${c.cov ?? ""}</td>
+      <td class="quiet">${esc([c.pot, c.calls ? "calls plays" : "", c.kind, c.spec, c.dev ? `DEV ${c.dev} · REC ${c.rec}` : ""].filter(Boolean).join(" · "))}</td><td class="r num">${c.pay ? money(c.pay) : ""}</td>
+      ${off ? `<td>${c.name ? `<input type="checkbox" data-fire="${c.key}" ${d.staff.fire.includes(c.key) ? "checked" : ""} ${open ? "" : "disabled"}>` : ""}</td>` : ""}</tr>`).join("")}</tbody></table></div>
+    ${!off ? `<p class="quiet">Letting a coach go opens in the offseason.</p>` : ""}
+    ${ST.report && ST.report.length ? `<section style="margin-top:18px"><h2>What happened</h2><ul>${ST.report.map((x) => `<li>${esc(x)}</li>`).join("")}</ul></section>` : ""}
+    <section style="margin-top:22px"><h2>If a chair opens</h2>
+      <div class="weekpick">${CHAIRS.map((k) => `<a class="chip ${k === chair ? "on" : ""}" href="javascript:void 0" data-chair="${k}">${k}${(d.staff.lists[k] || {}).names && d.staff.lists[k].names.length ? ` (${d.staff.lists[k].names.length})` : ""}</a>`).join("")}</div>
+      <div class="grid">
+        <section class="panel"><h3>Your list for ${esc(CHAIR_NAME[chair])}</h3>
+          ${L.names.length ? `<ol>${L.names.map((n, i) => `<li>${esc(n)} <button class="iconbtn" data-up="${i}" ${i === 0 ? "disabled" : ""}>↑</button><button class="iconbtn" data-rm="${i}">✕</button></li>`).join("")}</ol>` : `<p class="muted">Empty: the AD would hire on his own.</p>`}
+          ${isCoord ? `<h3 style="margin-top:10px">Your best package</h3><div class="controls">
+            <label>Up to $/yr <input type="number" step="50000" min="0" data-max="salary" value="${L.max.salary}"></label>
+            <label>Years <input type="number" min="1" max="6" data-max="years" value="${L.max.years}" style="width:64px"></label>
+            <label><input type="checkbox" data-max="calls" ${L.max.calls ? "checked" : ""}> He can call plays</label>
+            <label><input type="checkbox" data-max="title" ${L.max.title ? "checked" : ""}> Assistant head coach title</label>
+            <label><input type="checkbox" data-max="out" ${L.max.out ? "checked" : ""}> Head-job out-clause</label></div>
+            <p class="quiet">Standard coordinator pay here: ${money(ST.std.coord)}.</p>`
+            : `<div class="controls"><label>Pay up to <select data-prem="1">${[0, 15, 30].map((v) => `<option value="${v}" ${L.premium === v ? "selected" : ""}>${v ? v + "% over standard" : "standard"}</option>`).join("")}</select></label></div><p class="quiet">Standard position coach pay here: ${money(ST.std.pos)}.</p>`}
+        </section>
+        <section class="wide"><h3>On the market</h3><p class="quiet">What your staff knows before anyone calls: public buzz, the résumé and the ratings the game shows for coaches.</p>
+          <div class="table-wrap"><table><thead><tr><th>Coach</th><th class="r">Age</th><th class="r">OVR</th>${isCoord ? `<th class="r">Side</th><th class="r">REC</th>` : `<th class="r">DEV</th><th class="r">REC</th>`}<th>Now</th><th>Buzz</th><th></th></tr></thead><tbody>
+          ${market.map((c) => `<tr><td>${c.tie ? "★ " : ""}${esc(c.name)}<br><span class="quiet small">${esc([c.pers, c.pot, c.calls ? "calls plays" : "", c.unit, c.kind, c.spec].filter(Boolean).join(" · "))}</span></td><td class="r num">${c.age}</td><td class="r num">${c.cov}</td>
+            ${isCoord ? `<td class="r num">${c.side}</td><td class="r num">${c.rec}</td>` : `<td class="r num">${c.dev}</td><td class="r num">${c.rec}</td>`}<td class="quiet small">${esc(c.now)}</td><td>${esc(c.buzz)}</td>
+            <td>${open && !L.names.includes(c.name) && L.names.length < 10 ? `<button class="btn small" data-add="${esc(c.name)}">Add</button>` : ""}</td></tr>`).join("") || `<tr><td colspan="8" class="empty">Nobody on the market for this chair.</td></tr>`}</tbody></table></div>
+        </section></div></section>`;
+  el.onclick = (ev) => {
+    const t = ev.target.closest("[data-chair],[data-add],[data-up],[data-rm]");
+    if (!t) return;
+    if (t.dataset.chair) d._chair = t.dataset.chair;
+    else if (t.dataset.add) L.names.push(t.dataset.add);
+    else if (t.dataset.up) { const i = Number(t.dataset.up); [L.names[i - 1], L.names[i]] = [L.names[i], L.names[i - 1]]; }
+    else if (t.dataset.rm) L.names.splice(Number(t.dataset.rm), 1);
+    saveDraft(); rerender(myStaff);
+  };
+  el.onchange = (ev) => {
+    const t = ev.target;
+    if (t.dataset.fire) { d.staff.fire = d.staff.fire.filter((x) => x !== t.dataset.fire); if (t.checked) d.staff.fire.push(t.dataset.fire); }
+    else if (t.dataset.max) L.max[t.dataset.max] = t.type === "checkbox" ? (t.checked ? 1 : 0) : Number(t.value || 0);
+    else if (t.dataset.prem) L.premium = Number(t.value);
+    else return;
+    saveDraft();
+  };
+}
+
+function myMoney(el) {
+  const B = S.B, d = S.draft, M = B.money || {}, m = d.money, open = S.manifest.sections.includes("money");
+  const name = (pid) => (B.roster.find((p) => p.id === pid) || {}).n || `#${pid}`;
+  const tog = (arr, v, on) => { const i = arr.indexOf(v); if (on && i < 0) arr.push(v); if (!on && i >= 0) arr.splice(i, 1); };
+  el.innerHTML = `<p class="muted">Your budget is ${money(M.budget || 0)}; ${money(M.free || 0)} is free for NIL right now. Each ask below gets the same answer odds as in Coach Career, once a year per person. See the full budget on the Program tab.</p>
+    <div class="grid" style="margin-top:12px">
+    <section class="panel"><h2>Facilities</h2>${Object.entries(M.facilities || {}).map(([k, f]) => `<label class="choice ${m.facility === k ? "on" : ""}"><input type="radio" name="fac" value="${k}" ${m.facility === k ? "checked" : ""} ${open && f.ok ? "" : "disabled"}><span>${k === "recruiting" ? "Recruiting" : "Training"} facilities: level ${f.level} of 10<small>${f.ok ? `upgrade for ${money(f.cost)}` : esc(f.why)}</small></span></label>`).join("")}
+      <label class="choice ${!m.facility ? "on" : ""}"><input type="radio" name="fac" value="" ${!m.facility ? "checked" : ""} ${open ? "" : "disabled"}><span>No project this time</span></label></section>
+    <section class="panel"><h2>Find the money</h2>
+      <h3>Ask a player to take 25% less NIL</h3>${(M.deals || []).map(([pid, amt, asked]) => `<label><input type="checkbox" data-rs="${pid}" ${m.restructure.includes(pid) ? "checked" : ""} ${open && !asked ? "" : "disabled"}> ${esc(name(pid))} · ${money(amt)}/yr${asked ? " (asked this year)" : ""}</label><br>`).join("") || `<p class="muted">No deals count against next season.</p>`}
+      <h3 style="margin-top:10px">Ask a coordinator for 15% less</h3>${(M.coords || []).map(([r, n, sal, asked]) => `<label><input type="checkbox" data-cc="${r}" ${m.coordcut.includes(r) ? "checked" : ""} ${open && !asked ? "" : "disabled"}> ${r} ${esc(n)} · ${money(sal)}/yr</label><br>`).join("")}
+      <h3 style="margin-top:10px">Ask a position coach for 10% less</h3>${(M.pos || []).map(([g, n, sal, asked]) => `<label><input type="checkbox" data-pc="${g}" ${m.poscut.includes(g) ? "checked" : ""} ${open && !asked ? "" : "disabled"}> ${g} ${esc(n)} · ${money(sal)}</label>`).join(" ")}
+      ${(M.buyouts || []).length ? `<h3 style="margin-top:10px">Buyouts due next season</h3><ul>${M.buyouts.map(([n, amt, st]) => `<li>${esc(n)} · ${money(amt)}${st ? " (stretched)" : ""}</li>`).join("")}</ul><label><input type="checkbox" id="stretch" ${m.stretch ? "checked" : ""} ${open ? "" : "disabled"}> Ask to spread them over three years (10% more in all)</label>` : ""}
+    </section></div>`;
+  el.onchange = (ev) => {
+    const t = ev.target;
+    if (t.name === "fac") m.facility = t.value;
+    else if (t.dataset.rs) tog(m.restructure, Number(t.dataset.rs), t.checked);
+    else if (t.dataset.cc) tog(m.coordcut, t.dataset.cc, t.checked);
+    else if (t.dataset.pc) tog(m.poscut, t.dataset.pc, t.checked);
+    else if (t.id === "stretch") m.stretch = t.checked;
+    else return;
+    saveDraft(); rerender(myMoney);
+  };
+}
+
+function mySeason(el) {
+  const B = S.B, d = S.draft, E = B.seasonEnd || { nil: [], draft: [] }, open = S.manifest.sections.includes("nil");
+  const P = (pid) => B.roster.find((p) => p.id === pid) || {};
+  el.innerHTML = `<p class="muted">After the title game: players asking for NIL raises, and juniors deciding about the draft. Leave one blank and your staff handles it the way any program's staff would.</p>
+    <section style="margin-top:12px"><h2>NIL raises</h2><p class="quiet">Room in next year's NIL pool: ${money(E.room || 0)}.</p>
+    ${E.nil.length ? `<div class="table-wrap"><table><thead><tr><th>Player</th><th class="r">Now</th><th class="r">Asks</th><th>Staff would</th><th>Your answer</th></tr></thead><tbody>${E.nil.map((x) => { const p = P(x.id); return `<tr><td><a href="#/my/player/${x.id}">${esc(p.n)}</a> <span class="quiet">${esc(p.p)} ${esc(p.yr)} · ${esc(p.eval)}</span>${x.threat ? ` <span class="tag bad">portal threat</span>` : ""}</td>
+      <td class="r num">${money(x.was)}</td><td class="r num">${money(x.ask)}</td><td class="quiet">${x.staff}</td>
+      <td><select data-nil="${x.id}" ${open ? "" : "disabled"}><option value="">Staff decides</option><option value="pay" ${d.nilAns[x.id] === "pay" ? "selected" : ""}>Pay ${money(x.ask)}</option><option value="counter" ${d.nilAns[x.id] === "counter" ? "selected" : ""}>Counter at ${money(x.counter)}</option><option value="refuse" ${d.nilAns[x.id] === "refuse" ? "selected" : ""}>Refuse</option></select></td></tr>`; }).join("")}</tbody></table></div>` : `<p class="muted">Nobody is asking for a raise.</p>`}</section>
+    <section style="margin-top:22px"><h2>The draft</h2>
+    ${E.draft.length ? `<div class="table-wrap"><table><thead><tr><th>Player</th><th>Projected</th><th>What you tell him</th></tr></thead><tbody>${E.draft.map((x) => { const p = P(x.id); return `<tr><td><a href="#/my/player/${x.id}">${esc(p.n)}</a> <span class="quiet">${esc(p.p)} ${esc(p.yr)} · ${esc(p.eval)}</span></td><td>round ${x.round}</td>
+      <td><select data-draft="${x.id}" ${open ? "" : "disabled"}><option value="">Nothing yet</option><option value="stay" ${d.draftAns[x.id] === "stay" ? "selected" : ""}>Come back for another year</option><option value="go" ${d.draftAns[x.id] === "go" ? "selected" : ""}>Go: you're ready</option><option value="neutral" ${d.draftAns[x.id] === "neutral" ? "selected" : ""}>Your call, we support you</option></select></td></tr>`; }).join("")}</tbody></table></div><p class="quiet">It's his decision in the end: what you tell him moves the odds.</p>` : `<p class="muted">Nobody is draft-eligible with a real projection.</p>`}</section>`;
+  el.onchange = (ev) => {
+    const t = ev.target;
+    if (t.dataset.nil) { if (t.value) d.nilAns[t.dataset.nil] = t.value; else delete d.nilAns[t.dataset.nil]; }
+    else if (t.dataset.draft) { if (t.value) d.draftAns[t.dataset.draft] = t.value; else delete d.draftAns[t.dataset.draft]; }
+    else return;
+    saveDraft();
+  };
+}
+
+function myPortal(el) {
+  const B = S.B, d = S.draft, P = B.portal || {}, open = S.manifest.sections.includes("portal");
+  const pos = d._ppos || "";
+  const board = (P.board || []).filter((x) => !pos || x.p === pos);
+  el.innerHTML = `<p class="muted">Portal Window I. Talk to your own players who entered (a raise helps), and offer spots to anyone on the board. If you send nothing here, your staff works the portal for you.${P.room !== undefined ? ` NIL room for transfers: <b>${money(P.room)}</b>.` : ""}</p>
+    <section style="margin-top:12px"><h2>Leaving you</h2>${(P.mine || []).length ? `<div class="table-wrap"><table><thead><tr><th>Player</th><th>Looks like</th><th>Why</th><th class="r">NIL was</th><th>Keep him</th></tr></thead><tbody>
+      ${P.mine.map((x) => `<tr><td>${esc(x.n)} <span class="quiet">${esc(x.p)} ${esc(x.yr)}</span></td><td>${esc(x.looks)}</td><td class="quiet">${esc(x.why)}</td><td class="r num">${x.nil ? money(x.nil) : ""}</td>
+        <td>${x.dest ? `gone to ${teamLink(x.dest)}` : `<label><input type="checkbox" data-keep="${x.id}" ${d.keep[x.id] !== undefined ? "checked" : ""} ${open ? "" : "disabled"}> talk to him</label> <label>raise $<input type="number" step="5000" min="0" data-raise="${x.id}" value="${d.keep[x.id] || 0}" style="width:110px" ${open ? "" : "disabled"}></label>`}</td></tr>`).join("")}</tbody></table></div>` : `<p class="muted">Nobody from your roster entered.</p>`}</section>
+    <section style="margin-top:22px"><h2>The board</h2>
+      <div class="controls"><select id="ppos"><option value="">All positions</option>${S.rules.positions.map((p) => `<option ${p === pos ? "selected" : ""}>${p}</option>`).join("")}</select>
+        <span class="quiet">${Object.keys(d.poffer).length} of 8 offers</span></div>
+      <div class="table-wrap"><table><thead><tr><th>Player</th><th>Looks like (approx.)</th><th>From</th><th>Why he left</th><th>Offer</th></tr></thead><tbody>
+      ${board.slice(0, 150).map((x) => `<tr><td>${esc(x.n)} <span class="quiet">${esc(x.p)} ${esc(x.yr)}</span>${x.stars ? ` ${stars(x.stars)}` : ""}</td><td>${esc(x.looks)}</td><td>${teamLink(x.from)}</td><td class="quiet">${esc(x.why)}</td>
+        <td>${x.dest ? `to ${teamLink(x.dest)}` : `<label><input type="checkbox" data-poff="${x.id}" ${d.poffer[x.id] !== undefined ? "checked" : ""} ${open ? "" : "disabled"}> offer</label> <label>NIL $<input type="number" step="5000" min="0" data-pnil="${x.id}" value="${d.poffer[x.id] || 0}" style="width:110px" ${open ? "" : "disabled"}></label>`}</td></tr>`).join("") || `<tr><td colspan="5" class="empty">Nobody here.</td></tr>`}</tbody></table></div></section>`;
+  el.onchange = (ev) => {
+    const t = ev.target;
+    if (t.id === "ppos") { d._ppos = t.value; saveDraft(); rerender(myPortal); return; }
+    if (t.dataset.keep) { if (t.checked) d.keep[t.dataset.keep] = d.keep[t.dataset.keep] || 0; else delete d.keep[t.dataset.keep]; }
+    else if (t.dataset.raise) { d.keep[t.dataset.raise] = Number(t.value || 0); }
+    else if (t.dataset.poff) { if (t.checked && Object.keys(d.poffer).length < 8) d.poffer[t.dataset.poff] = d.poffer[t.dataset.poff] || 0; else delete d.poffer[t.dataset.poff]; }
+    else if (t.dataset.pnil) { if (d.poffer[t.dataset.pnil] !== undefined) d.poffer[t.dataset.pnil] = Number(t.value || 0); }
+    else return;
+    saveDraft(); rerender(myPortal);
+  };
+}
+
+function myRosterWeek(el) {
+  const B = S.B, d = S.draft, R = B.rosterWeek || {}, open = S.manifest.sections.includes("roster");
+  const ideas = {};
+  (R.ideas || []).forEach(([pid, from, to, why]) => (ideas[pid] = [to, why]));
+  const groups = {};
+  B.roster.forEach((p) => (groups[p.p] = groups[p.p] || []).push(p));
+  el.innerHTML = `<p class="muted">The new class is on campus. Move players to new positions and cut anyone you don't want to carry. When the cycle runs, every room is trimmed to its size (lowest first, walk-ons before scholarship players) and filled with walk-ons where short.</p>
+    ${S.rules.positions.filter((pos) => groups[pos]).map((pos) => { const cnt = (R.count || {})[pos] || 0, size = (R.size || {})[pos] || 0; return `<section><h2>${pos} <span class="quiet">${cnt} of ${size}${cnt > size ? `, ${cnt - size} over` : ""}</span></h2><div class="table-wrap"><table><tbody>
+      ${groups[pos].map((p) => `<tr><td>${esc(p.n)} <span class="quiet">${esc(p.yr)}</span></td><td>${esc(p.eval)}</td><td class="quiet">${ideas[p.id] ? `staff idea: ${esc(ideas[p.id][0])} (${esc(ideas[p.id][1])})` : ""}</td>
+        <td><select data-move="${p.id}" ${open ? "" : "disabled"}><option value="">stay at ${pos}</option>${S.rules.positions.filter((x) => x !== pos).map((x) => `<option ${d.moves[p.id] === x ? "selected" : ""}>${x}</option>`).join("")}</select></td>
+        <td><label><input type="checkbox" data-cut="${p.id}" ${d.cuts.includes(p.id) ? "checked" : ""} ${open ? "" : "disabled"}> cut</label></td></tr>`).join("")}</tbody></table></div></section>`; }).join("")}`;
+  el.onchange = (ev) => {
+    const t = ev.target;
+    if (t.dataset.move) { if (t.value) d.moves[t.dataset.move] = t.value; else delete d.moves[t.dataset.move]; }
+    else if (t.dataset.cut) { const id = Number(t.dataset.cut); d.cuts = d.cuts.filter((x) => x !== id); if (t.checked) d.cuts.push(id); }
+    else return;
+    saveDraft();
+  };
+}
+
+const EMPH = { fundamentals: ["Fundamentals", "Young players develop faster; cleaner technique, lower volatility."], competition: ["Competition", "More live reps; sharper evaluations and more depth-chart movement."],
+  young: ["Young players", "Freshmen and sophomores get extra reps and development."], physical: ["Physicality", "OL/DL/LB/RB extra work; more development, a little more injury risk."],
+  chemistry: ["Chemistry", "Leadership and team work; morale rises and the room settles."], passing: ["Passing game", "QB/WR/TE/CB/S get extra competitive reps."] };
+
+function mySpring(el) {
+  const B = S.B, d = S.draft, open = S.manifest.sections.includes("spring"), R = B.spring;
+  el.innerHTML = `${open ? `<section class="panel"><h2>Spring plan</h2><div class="choices">${Object.entries(EMPH).map(([k, [l, b]]) => `<label class="choice ${d.spring.emphasis === k ? "on" : ""}"><input type="radio" name="emph" value="${k}" ${d.spring.emphasis === k ? "checked" : ""}><span>${l}<small>${b}</small></span></label>`).join("")}</div>
+      <h3 style="margin-top:12px">Position battles to watch (up to 3)</h3><div class="controls">${S.rules.positions.map((p) => `<label><input type="checkbox" data-focus="${p}" ${d.spring.focus.includes(p) ? "checked" : ""}> ${p}</label>`).join("")}</div></section>` : ""}
+    ${R ? `<section style="margin-top:20px"><h2>Spring ${R.year}: ${esc((EMPH[R.emphasis] || [R.emphasis])[0])}</h2>
+      <p>A-Day: <b>${esc((R.aday || {}).score || "")}</b></p>
+      <div class="grid"><section><h3>Stock up</h3><ul>${(R.stock_up || []).map((x) => `<li>${esc(x)}</li>`).join("") || "<li class='quiet'>Nobody stood out.</li>"}</ul></section>
+      <section><h3>Stock down</h3><ul>${(R.stock_down || []).map((x) => `<li>${esc(x)}</li>`).join("") || "<li class='quiet'>Nobody slipped.</li>"}</ul></section>
+      <section><h3>A-Day film</h3><ul>${((R.aday || {}).film || []).slice(0, 8).map(([n, p, sc]) => `<li>${esc(p)} ${esc(n)} <span class="quiet">${sc > 0 ? "+" : ""}${sc}</span></li>`).join("")}</ul></section>
+      ${(R.injuries || []).length ? `<section><h3>Medical</h3><ul>${R.injuries.map((x) => `<li>${esc(x)}</li>`).join("")}</ul></section>` : ""}</div></section>` : ""}`;
+  el.onchange = (ev) => {
+    const t = ev.target;
+    if (t.name === "emph") d.spring.emphasis = t.value;
+    else if (t.dataset.focus) { d.spring.focus = d.spring.focus.filter((x) => x !== t.dataset.focus); if (t.checked && d.spring.focus.length < 3) d.spring.focus.push(t.dataset.focus); }
+    else return;
+    saveDraft(); rerender(mySpring);
+  };
 }
 
 function buildOrders() {
@@ -808,6 +1118,24 @@ function buildOrders() {
   }
   if (secs.includes("plan")) o.plan = { focus: d.plan.focus, off: d.plan.off, def: d.plan.def, script: d.plan.script ? 1 : 0 };
   if (secs.includes("calls")) o.calls = { off: d.calls.off, def: d.calls.def };
+  if (secs.includes("staff") && d.staff) {
+    const lists = {};
+    Object.entries(d.staff.lists).forEach(([k, v]) => { if (v && v.names && v.names.length) lists[k] = v; });
+    if (d.staff.fire.length || Object.keys(lists).length) o.staff = { fire: d.staff.fire, lists };
+  }
+  if (secs.includes("money") && d.money) {
+    const m = d.money;
+    if (m.facility || m.restructure.length || m.coordcut.length || m.poscut.length || m.stretch) o.money = m;
+  }
+  if (secs.includes("nil") && (Object.keys(d.nilAns).length || Object.keys(d.draftAns).length)) {
+    o.nil = { nil: Object.entries(d.nilAns).map(([k, v]) => [Number(k), v]), draft: Object.entries(d.draftAns).map(([k, v]) => [Number(k), v]) };
+  }
+  if (secs.includes("portal") && (Object.keys(d.keep).length || Object.keys(d.poffer).length)) {
+    o.portal = { keep: Object.entries(d.keep).map(([k, v]) => [Number(k), Number(v) || 0]), offer: Object.entries(d.poffer).map(([k, v]) => [Number(k), Number(v) || 0]) };
+  }
+  if (secs.includes("roster") && (Object.keys(d.moves).length || d.cuts.length)) o.roster = { move: Object.entries(d.moves).map(([k, v]) => [Number(k), v]), cut: d.cuts };
+  if (secs.includes("spring")) o.spring = { emphasis: d.spring.emphasis, focus: d.spring.focus };
+  if (secs.includes("jobs") && d.jobs) o.jobs = { want: [...new Set(d.jobs.want.filter(Boolean))].slice(0, 3), extend: d.jobs.extend || "ask" };
   return o;
 }
 
@@ -821,6 +1149,13 @@ function myCode(el) {
     ["ov", "nil", "prom", "pwo"].forEach((k) => o.rec[k] && lines.push(`${{ ov: "Official visits", nil: "NIL offers", prom: "Promises", pwo: "Walk-on invites" }[k]}: ${o.rec[k].length}`));
   }
   if (o.plan) lines.push(`Practice: ${o.plan.focus === "staff" ? "the staff's call" : S.rules.focus[o.plan.focus].label}; offense: ${o.plan.off === "film" ? "the film's read" : S.rules.offKeys[o.plan.off].label}; defense: ${o.plan.def === "film" ? "the film's read" : S.rules.defKeys[o.plan.def].label}`);
+  if (o.staff) lines.push(`Staff: ${o.staff.fire.length ? "let go " + o.staff.fire.join(", ") + "; " : ""}lists for ${Object.keys(o.staff.lists).join(", ") || "no chairs"}`);
+  if (o.money) lines.push(`Money: ${[o.money.facility && o.money.facility + " facilities", o.money.restructure.length && o.money.restructure.length + " NIL restructures", o.money.coordcut.length && "coordinator pay cuts", o.money.poscut.length && "position coach pay cuts", o.money.stretch && "stretch buyouts"].filter(Boolean).join(", ")}`);
+  if (o.nil) lines.push(`Season end: ${o.nil.nil.length} NIL answers, ${o.nil.draft.length} draft talks`);
+  if (o.portal) lines.push(`Portal: ${o.portal.keep.length} retention talks, ${o.portal.offer.length} offers`);
+  if (o.roster) lines.push(`Roster week: ${o.roster.move.length} position changes, ${o.roster.cut.length} cuts`);
+  if (o.spring) lines.push(`Spring: ${(EMPH[o.spring.emphasis] || [o.spring.emphasis])[0]}${o.spring.focus.length ? ", watching " + o.spring.focus.join(", ") : ""}`);
+  if (o.jobs) lines.push(`Jobs: ${o.jobs.want.length ? o.jobs.want.map((id) => team(id).school).join(", ") : "not looking"}; extension offers: ${{ ask: "ask me", yes: "sign", no: "turn down" }[o.jobs.extend]}`);
   if (o.calls) lines.push(`Play-calling: offense ${o.calls.off === "HC" ? "you" : "your OC"}, defense ${o.calls.def === "HC" ? "you" : "your DC"}`);
   if (o.depth) lines.push(`Depth chart: ${Object.entries(o.depth).map(([k, v]) => `${k} ${v === "staff" ? "back to the staff" : "your order"}`).join(", ")}`);
   el.innerHTML = `<section class="panel"><h2>Cycle ${B.cycle} orders</h2>

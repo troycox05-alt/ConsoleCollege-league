@@ -263,3 +263,12 @@ pre.screen { font: 12.5px/1.35 ui-monospace, "SF Mono", Menlo, Consolas, monospa
 td.tags .tag { margin: 1px 0; }
 tr.starter-row td:first-child { box-shadow: inset 3px 0 0 var(--turf); }
 .grid > section + section { margin-top: 0; }
+
+/* box scores */
+.boxhead { display: flex; flex-wrap: wrap; gap: 6px 14px; align-items: baseline; }
+.boxhead .won { font-weight: 700; }
+table.box tr.won td { font-weight: 600; }
+table.box td.tight, table td.tight { width: 1%; white-space: nowrap; }
+.qhead { margin: 12px 0 4px; font-size: 14px; color: var(--ink-3); }
+table.box + table.box, .table-wrap + .table-wrap { margin-top: 10px; }
+details summary { cursor: pointer; padding: 6px 0; }
